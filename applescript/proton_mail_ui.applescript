@@ -305,7 +305,7 @@ on draftCandidates(subjectText)
     repeat with candidate in allItems
         if my safeRole(candidate) is "AXHeading" then
             set candidateSubject to my canonicalText(my elementLabel(candidate))
-            if candidateSubject is subjectText then
+            if my subjectMatches(subjectText, candidateSubject) then
                 set rowElement to my safeParent(candidate)
                 if rowElement is not missing value then
                     set rowItems to my boundedContents(rowElement)
@@ -317,6 +317,23 @@ on draftCandidates(subjectText)
     end repeat
     return candidates
 end draftCandidates
+
+on subjectMatches(subjectText, candidateSubject)
+    if candidateSubject is subjectText then return true
+    if candidateSubject is "" then return false
+
+    set prefixText to candidateSubject
+    if candidateSubject ends with "..." then
+        if (length of candidateSubject) ≤ 3 then return false
+        set prefixText to text 1 thru ((length of candidateSubject) - 3) of candidateSubject
+    else if candidateSubject ends with "…" then
+        if (length of candidateSubject) ≤ 1 then return false
+        set prefixText to text 1 thru ((length of candidateSubject) - 1) of candidateSubject
+    end if
+    if prefixText is "" then return false
+
+    return subjectText begins with prefixText
+end subjectMatches
 
 on waitForInternalIdentifier(internalIdentifier, deadlineDate)
     repeat while (current date) < deadlineDate

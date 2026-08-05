@@ -853,7 +853,10 @@ mod tests {
         assert!(source.contains("Remove "));
         assert!(source.contains("if visibleBody is not expectedNormalizedBody"));
         assert!(source.contains("precomposedStringWithCanonicalMapping"));
-        assert!(source.contains("if candidateSubject is subjectText then"));
+        assert!(source.contains("if my subjectMatches(subjectText, candidateSubject) then"));
+        assert!(source.contains("on subjectMatches(subjectText, candidateSubject)"));
+        assert!(source.contains("return subjectText begins with prefixText"));
+        assert!(source.contains("if candidateSubject is \"\" then return false"));
         assert!(!source.contains("subjectText is \"\" or candidateSubject is subjectText"));
         assert!(!source.contains("(No Subject)"));
         assert!(source.contains("display dialog"));
