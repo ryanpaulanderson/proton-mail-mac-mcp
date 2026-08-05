@@ -857,6 +857,10 @@ mod tests {
         assert!(source.contains("on subjectMatches(subjectText, candidateSubject)"));
         assert!(source.contains("return subjectText begins with prefixText"));
         assert!(source.contains("if candidateSubject is \"\" then return false"));
+        assert!(source.contains("set fallbackRows to {}"));
+        assert!(source.contains(
+            "if subjectText is \"\" and (count of candidates) is 0 then return fallbackRows"
+        ));
         assert!(!source.contains("subjectText is \"\" or candidateSubject is subjectText"));
         assert!(!source.contains("(No Subject)"));
         assert!(source.contains("display dialog"));

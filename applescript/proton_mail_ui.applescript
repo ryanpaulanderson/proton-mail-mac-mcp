@@ -302,19 +302,25 @@ on draftCandidates(subjectText)
     set targetWindow to my oneMainWindow(true)
     set allItems to my boundedContents(targetWindow)
     set candidates to {}
+    set fallbackRows to {}
     repeat with candidate in allItems
         if my safeRole(candidate) is "AXHeading" then
             set candidateSubject to my canonicalText(my elementLabel(candidate))
-            if my subjectMatches(subjectText, candidateSubject) then
-                set rowElement to my safeParent(candidate)
-                if rowElement is not missing value then
-                    set rowItems to my boundedContents(rowElement)
-                    if my listHasRole(rowItems, "AXCheckBox") then set end of candidates to rowElement
+            set rowElement to my safeParent(candidate)
+            if rowElement is not missing value then
+                set rowItems to my boundedContents(rowElement)
+                if my listHasRole(rowItems, "AXCheckBox") then
+                    if subjectText is "" and (count of fallbackRows) < 20 then set end of fallbackRows to rowElement
+                    if my subjectMatches(subjectText, candidateSubject) then set end of candidates to rowElement
                 end if
             end if
         end if
         if (count of candidates) ≥ 20 then exit repeat
     end repeat
+    -- Empty subjects may use a version-sensitive non-empty placeholder. If no
+    -- stable label match exists, retain a bounded list for identity probing;
+    -- openDraft must verify the exact internal ID before accepting a row.
+    if subjectText is "" and (count of candidates) is 0 then return fallbackRows
     return candidates
 end draftCandidates
 
