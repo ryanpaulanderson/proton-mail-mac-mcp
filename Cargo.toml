@@ -1,0 +1,18 @@
+[package]
+name = "proton-mail-mac-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A local MCP bridge for Proton Mail on macOS"
+license = "MIT"
+repository = "https://github.com/ryanpaulanderson/proton-mail-mac-mcp"
+publish = false
+
+[[bin]]
+name = "proton-mail-mac-mcp"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
