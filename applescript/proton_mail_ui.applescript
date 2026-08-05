@@ -305,7 +305,7 @@ on draftCandidates(subjectText)
     repeat with candidate in allItems
         if my safeRole(candidate) is "AXHeading" then
             set candidateSubject to my canonicalText(my elementLabel(candidate))
-            if subjectText is "" or candidateSubject is subjectText then
+            if candidateSubject is subjectText then
                 set rowElement to my safeParent(candidate)
                 if rowElement is not missing value then
                     set rowItems to my boundedContents(rowElement)

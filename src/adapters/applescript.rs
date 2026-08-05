@@ -853,7 +853,8 @@ mod tests {
         assert!(source.contains("Remove "));
         assert!(source.contains("if visibleBody is not expectedNormalizedBody"));
         assert!(source.contains("precomposedStringWithCanonicalMapping"));
-        assert!(source.contains("subjectText is \"\""));
+        assert!(source.contains("if candidateSubject is subjectText then"));
+        assert!(!source.contains("subjectText is \"\" or candidateSubject is subjectText"));
         assert!(!source.contains("(No Subject)"));
         assert!(source.contains("display dialog"));
         assert!(source.contains("default button \"Cancel\""));
