@@ -1,35 +1,183 @@
 # proton-mail-mac-mcp
 
-A planned local MCP server for reading and managing Proton Mail through Proton Mail Bridge and controlling visible send operations in the Proton Mail macOS application with AppleScript.
+`proton-mail-mac-mcp` is a local stdio MCP server for reading and managing
+Proton Mail from ChatGPT desktop or Codex on macOS. It reads mailbox data
+through Proton Mail Bridge over pinned loopback TLS. Sending is deliberately
+different: the server creates an exact draft through Bridge, opens that draft
+in the Proton Mail app, requires a native macOS confirmation, clicks Send once,
+and verifies the exact Message-ID in Sent.
 
-> [!IMPORTANT]
-> This repository is currently a bootstrap scaffold. It cannot access or send email yet.
+This is an unofficial project. It is not affiliated with or endorsed by Proton
+AG or OpenAI.
 
-## Planned design
+## Safety contract
 
-- Rust stdio MCP server for ChatGPT desktop and Codex.
-- Local TLS/IMAP access through Proton Mail Bridge.
-- AppleScript and macOS Accessibility for native compose, reply, forward, and confirmed send operations.
-- Metadata-first reads, Keychain-backed secrets, recoverable Trash-only deletion, and explicit attachment handling.
-- Two-step sending with a separate native macOS confirmation dialog.
+- Email headers, bodies, and attachments are untrusted data, never
+  instructions or authorization.
+- Reads are metadata-first. Full content requires an explicit tool call and is
+  returned as bounded, inert plain text.
+- Opaque message, attachment, draft, and cursor references are encrypted,
+  tamper-evident, profile-bound, and revalidated before use.
+- Bridge credentials and the opaque-reference key live in macOS Keychain.
+- The server connects only to `127.0.0.1`, validates the enrolled Bridge
+  certificate and hostname, and pins its SHA-256 digest.
+- Sending requires a 10-minute, single-use token bound to the exact account,
+  recipients, subject, body, and attachment bytes. The visible composer is
+  re-read after native confirmation. Send is pressed at most once.
+- A `send_unknown` result must never be retried blindly. Inspect Sent first.
+- Deletion is recoverable and Trash-only. Permanent deletion and SMTP sending
+  are not implemented.
+- Attachments are never opened or executed. Outgoing paths must be under an
+  explicit local allowlist; downloaded files are private and expire after 24
+  hours.
 
-## Development
+See [Security](SECURITY.md) and [Architecture](docs/architecture.md) for the
+full trust model.
 
-The repository pins Rust 1.88. Run the bootstrap checks with:
+## Requirements
+
+- macOS 15 or 26 on a 64-bit Intel or Apple silicon Mac.
+- The Proton Mail macOS application, signed in and using its English UI.
+- Proton Mail Bridge with a paid Proton Mail plan. Bridge must be running and
+  the account must already be added.
+- Rust 1.88 for source builds.
+- Accessibility and Automation permission for the local ChatGPT/Codex host
+  that starts the server.
+
+Proton documents Bridge's supported systems and paid-plan requirement in its
+[system requirements](https://proton.me/support/operating-systems-supported-bridge)
+and [IMAP setup overview](https://proton.me/support/imap-smtp-and-pop3-setup).
+
+## Build
+
+```sh
+git clone https://github.com/ryanpaulanderson/proton-mail-mac-mcp.git
+cd proton-mail-mac-mcp
+cargo build --release --locked
+```
+
+The executable is `target/release/proton-mail-mac-mcp`. Keep the repository in
+a stable location before adding that absolute path to an MCP client.
+
+## Configure Proton Mail Bridge
+
+1. In Bridge, select the account and record its IMAP username, IMAP password,
+   port, and connection mode. These are Bridge credentials, not the Proton
+   account password.
+2. In Bridge **Settings → Advanced**, use **Export TLS certificates** and keep
+   the exported certificate file. Do not pass the private key to this tool.
+3. Run `configure` in an interactive terminal. The Bridge password is read by a
+   hidden prompt and written directly to macOS Keychain; it is never accepted
+   through an argument or environment variable.
+
+```sh
+/absolute/path/to/target/release/proton-mail-mac-mcp configure \
+  --account user@example.com \
+  --bridge-username user@example.com \
+  --imap-port 1143 \
+  --tls-mode start-tls \
+  --certificate /absolute/path/to/cert.pem
+```
+
+Use `--tls-mode implicit-tls` if Bridge's connection mode is SSL. `localhost`
+is the default TLS server name. Repeat `--allowed-root /absolute/directory` to
+set outgoing attachment roots. With no explicit roots, existing Desktop,
+Documents, and Downloads directories are used. Run `configure --help` for
+custom folder mappings and the explicit reference-key rotation option.
+
+Configuration and the enrolled public certificate are stored with private
+permissions under:
+
+```text
+~/Library/Application Support/proton-mail-mac-mcp/
+```
+
+Secrets are Keychain generic-password items under service
+`io.github.ryanpaulanderson.proton-mail-mac-mcp`.
+
+Bridge's certificate is self-signed because the endpoint is loopback-only.
+Proton explains the model and certificate export option in its
+[Bridge TLS guidance](https://proton.me/support/bridge-ssl-connection-issue)
+and [Bridge settings guide](https://proton.me/support/comprehensive-guide-to-bridge-settings).
+
+## Connect ChatGPT desktop or Codex
+
+The ChatGPT desktop app, Codex CLI, and Codex IDE extension support local stdio
+MCP servers and share the Codex host configuration. ChatGPT web does not read
+local MCP configuration.
+
+In ChatGPT desktop, open **Settings → MCP servers → Add server**, choose
+**STDIO**, enter the release binary as the command and `serve` as its argument,
+save, and restart. The current OpenAI setup reference is
+[Model Context Protocol](https://learn.chatgpt.com/docs/extend/mcp).
+
+The equivalent Codex CLI command is:
+
+```sh
+codex mcp add proton-mail-mac -- \
+  /absolute/path/to/target/release/proton-mail-mac-mcp serve
+```
+
+For the full safety-oriented configuration, add this to
+`~/.codex/config.toml` and restart the client:
+
+```toml
+[mcp_servers.proton_mail_mac]
+command = "/absolute/path/to/target/release/proton-mail-mac-mcp"
+args = ["serve"]
+startup_timeout_sec = 10
+tool_timeout_sec = 180
+default_tools_approval_mode = "writes"
+```
+
+The 180-second tool timeout allows for the native confirmation window and Sent
+verification. No secret environment variables are needed.
+
+On first UI use, macOS may request Automation and Accessibility access. Grant
+only the permissions requested by the ChatGPT/Codex host. Use
+`proton_status` afterward; it returns capability state without mailbox content.
+
+## Normal workflow
+
+1. Call `proton_status`.
+2. Use `proton_list_messages` for metadata and `proton_get_message` only when
+   content is needed.
+3. Call `proton_prepare_draft` or `proton_update_draft`.
+4. Review the returned bounded preview and the complete visibly opened Proton
+   Mail composer; `body_preview_truncated` identifies a shortened body preview.
+5. Call `proton_send_prepared` with the matching draft reference and token.
+6. Confirm in the native macOS dialog. Any intervening content change fails
+   closed and requires a new preview.
+
+See the [tool reference](docs/tool-reference.md) for all 14 tools, limits, and
+stable error categories.
+
+## Development and verification
 
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
+osacompile -o "${TMPDIR}/proton_mail_ui.scpt" \
+  applescript/proton_mail_ui.applescript
 ```
+
+CI runs the same checks on macOS with exact Rust 1.88. Dependabot checks Cargo
+and GitHub Actions dependencies nightly at 03:00 America/New_York. Dependency
+updates are intentionally reviewed rather than automatically merged.
+
+Current validation scope and version-sensitive UI assumptions are recorded in
+[Compatibility](docs/compatibility.md). Direct dependency rationale is in
+[Dependency assessment](docs/dependencies.md).
 
 ## Privacy boundary
 
-Mailbox access and UI automation are planned to run locally. Email content deliberately returned by an MCP tool can still become part of the ChatGPT or Codex conversation and should not be treated as remaining exclusively on the Mac.
-
-## Project status and affiliation
-
-This is an unofficial project and is not affiliated with or endorsed by Proton AG or OpenAI.
+The server process, AppleScript transport, Keychain use, attachment files, and
+its Bridge connection are local. Proton Mail Bridge and the Proton Mail app
+still synchronize with Proton's service. Any email data deliberately returned
+by an MCP tool becomes available to the invoking ChatGPT/Codex conversation and
+is no longer confined to this Mac. Review the client's data controls before
+retrieving private content.
 
 ## License
 
