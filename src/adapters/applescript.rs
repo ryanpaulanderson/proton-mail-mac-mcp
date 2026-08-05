@@ -175,16 +175,11 @@ impl UiAutomation for AppleScriptUi {
 
     async fn open_draft(&self, draft: &StoredDraft) -> Result<(), AppError> {
         let internal_id = required_internal_id(draft)?;
-        let row_subject = if draft.content.subject.as_str().is_empty() {
-            "(No Subject)"
-        } else {
-            draft.content.subject.as_str()
-        };
         self.request(&OpenDraftRequest {
             version: SCRIPT_PROTOCOL_VERSION,
             operation: "open_draft",
             internal_id,
-            row_subject,
+            row_subject: draft.content.subject.as_str(),
         })
         .await?;
         Ok(())
@@ -716,6 +711,43 @@ mod tests {
         }
     }
 
+    struct OpenDraftRunner;
+
+    #[async_trait]
+    impl ScriptRunner for OpenDraftRunner {
+        async fn run(&self, _script: &Path, request: &[u8]) -> Result<Vec<u8>, AppError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(request).expect("valid test request");
+            assert_eq!(
+                request.get("operation").and_then(serde_json::Value::as_str),
+                Some("open_draft")
+            );
+            assert_eq!(
+                request
+                    .get("row_subject")
+                    .and_then(serde_json::Value::as_str),
+                Some("")
+            );
+            Ok(br#"{"version":1,"status":"ok"}"#.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_subject_draft_discovery_does_not_assume_a_localized_label() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let script = directory.path().join("ui.applescript");
+        install_embedded_script(&script).expect("install embedded script");
+        let adapter =
+            AppleScriptUi::new(script, Arc::new(OpenDraftRunner)).expect("create adapter");
+        let mut draft = test_draft();
+        draft.content.subject = Subject::parse("").expect("valid empty subject");
+
+        adapter
+            .open_draft(&draft)
+            .await
+            .expect("open empty subject draft");
+    }
+
     #[tokio::test]
     async fn send_contract_uses_static_script_and_returns_native_cancellation() {
         let directory = tempfile::tempdir().expect("create temporary directory");
@@ -820,6 +852,9 @@ mod tests {
         assert!(source.contains("requireExactKeys"));
         assert!(source.contains("Remove "));
         assert!(source.contains("if visibleBody is not expectedNormalizedBody"));
+        assert!(source.contains("precomposedStringWithCanonicalMapping"));
+        assert!(source.contains("subjectText is \"\""));
+        assert!(!source.contains("(No Subject)"));
         assert!(source.contains("display dialog"));
         assert!(source.contains("default button \"Cancel\""));
         assert!(source.contains("my raiseAdapterError(1706)"));

@@ -666,9 +666,14 @@ impl MailRepository for BridgeImapRepository {
                         "Proton Mail Bridge omitted a Sent candidate header.",
                     )
                 })?;
-                let observed_date = fetch_date(fetch)?;
-                let summary = parse_summary(header, observed_date)?;
-                if summary.message_id.as_deref() == Some(message_id) && observed_date >= cutoff {
+                let observed_date = optional_fetch_date(fetch);
+                let summary = parse_summary(header, observed_date.unwrap_or(sent_after))?;
+                if is_exact_sent_candidate(
+                    summary.message_id.as_deref(),
+                    message_id,
+                    observed_date.as_ref(),
+                    &cutoff,
+                ) {
                     exact_matches = exact_matches.saturating_add(1);
                 }
             }
@@ -1222,16 +1227,27 @@ fn single_fetch(
 }
 
 fn fetch_date(fetch: &async_imap::types::Fetch) -> Result<DateTime<Utc>, AppError> {
-    if let Some(date) = fetch.internal_date() {
-        return Ok(date.with_timezone(&Utc));
-    }
-    DateTime::from_timestamp(0, 0).ok_or_else(|| {
+    optional_fetch_date(fetch).ok_or_else(|| {
         AppError::new(
-            ErrorCode::Internal,
-            "construct fallback message date",
-            "Message date could not be represented.",
+            ErrorCode::BridgeUnavailable,
+            "read message internal date",
+            "Proton Mail Bridge omitted a requested message date.",
         )
     })
+}
+
+fn optional_fetch_date(fetch: &async_imap::types::Fetch) -> Option<DateTime<Utc>> {
+    fetch.internal_date().map(|date| date.with_timezone(&Utc))
+}
+
+fn is_exact_sent_candidate(
+    observed_message_id: Option<&str>,
+    expected_message_id: &str,
+    observed_internal_date: Option<&DateTime<Utc>>,
+    cutoff: &DateTime<Utc>,
+) -> bool {
+    observed_message_id == Some(expected_message_id)
+        && observed_internal_date.is_none_or(|date| date >= cutoff)
 }
 
 fn capability_name(capability: &async_imap::types::Capability) -> String {
@@ -1315,7 +1331,7 @@ mod tests {
 
     use crate::domain::{mail::SearchCriteria, value::EmailAddress};
 
-    use super::{build_search_query, decode_sha256, quote_search};
+    use super::{build_search_query, decode_sha256, is_exact_sent_candidate, quote_search};
 
     #[test]
     fn search_values_are_quoted_without_command_injection() {
@@ -1352,5 +1368,36 @@ mod tests {
             [0xab; 32]
         );
         assert!(decode_sha256(&"gg".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn exact_sent_identity_tolerates_only_a_missing_internal_date() {
+        let cutoff = Utc
+            .with_ymd_and_hms(2026, 8, 1, 12, 0, 0)
+            .single()
+            .expect("valid cutoff");
+        let older = Utc
+            .with_ymd_and_hms(2026, 8, 1, 11, 59, 59)
+            .single()
+            .expect("valid older date");
+
+        assert!(is_exact_sent_candidate(
+            Some("draft@example.com"),
+            "draft@example.com",
+            None,
+            &cutoff,
+        ));
+        assert!(!is_exact_sent_candidate(
+            Some("other@example.com"),
+            "draft@example.com",
+            None,
+            &cutoff,
+        ));
+        assert!(!is_exact_sent_candidate(
+            Some("draft@example.com"),
+            "draft@example.com",
+            Some(&older),
+            &cutoff,
+        ));
     }
 }

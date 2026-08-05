@@ -7,6 +7,7 @@ property protocolVersion : 1
 property maximumElements : 5000
 property pollIntervalSeconds : 0.2
 property openTimeoutSeconds : 15
+property candidateIdentityTimeoutSeconds : 1
 property postconditionTimeoutSeconds : 12
 property attachmentDetailsTimeoutSeconds : 3
 
@@ -110,7 +111,7 @@ end healthResponse
 on openDraft(requestObject)
     set internalIdentifier to my requiredText(requestObject, "internal_id")
     if (length of internalIdentifier) > 512 or internalIdentifier contains "/" or internalIdentifier contains return or internalIdentifier contains linefeed then my raiseAdapterError(1701)
-    set subjectText to my requiredText(requestObject, "row_subject")
+    set subjectText to my canonicalText(my requiredText(requestObject, "row_subject"))
     my ensureApplicationReady()
     set deadlineDate to (current date) + openTimeoutSeconds
     set candidatePosition to 1
@@ -122,7 +123,9 @@ on openDraft(requestObject)
         if (count of candidates) ≥ candidatePosition then
             set candidateRow to item candidatePosition of candidates
             my pressElement(candidateRow)
-            if my waitForInternalIdentifier(internalIdentifier, deadlineDate) then
+            set candidateDeadlineDate to (current date) + candidateIdentityTimeoutSeconds
+            if candidateDeadlineDate > deadlineDate then set candidateDeadlineDate to deadlineDate
+            if my waitForInternalIdentifier(internalIdentifier, candidateDeadlineDate) then
                 my waitForComposer(deadlineDate)
                 return
             end if
@@ -182,7 +185,9 @@ on verifyComposer(requestObject)
     set composerRoot to my composerRootFor(sendButton)
     set composerItems to my boundedContents(composerRoot)
     set subjectField to my oneElementFromList(composerItems, "AXTextField", "Subject", false)
-    if my safeValue(subjectField) is not expectedSubject then my raiseAdapterError(1705)
+    set visibleSubject to my canonicalText(my safeValue(subjectField))
+    set expectedCanonicalSubject to my canonicalText(expectedSubject)
+    if visibleSubject is not expectedCanonicalSubject then my raiseAdapterError(1705)
     my oneElementFromList(composerItems, "AXButton", expectedFrom, false)
     my verifyRecipients(composerItems, expectedTo, expectedCc, expectedBcc)
     my verifyAttachments(composerRoot, expectedAttachments)
@@ -298,11 +303,14 @@ on draftCandidates(subjectText)
     set allItems to my boundedContents(targetWindow)
     set candidates to {}
     repeat with candidate in allItems
-        if my safeRole(candidate) is "AXHeading" and my elementLabel(candidate) is subjectText then
-            set rowElement to my safeParent(candidate)
-            if rowElement is not missing value then
-                set rowItems to my boundedContents(rowElement)
-                if my listHasRole(rowItems, "AXCheckBox") then set end of candidates to rowElement
+        if my safeRole(candidate) is "AXHeading" then
+            set candidateSubject to my canonicalText(my elementLabel(candidate))
+            if subjectText is "" or candidateSubject is subjectText then
+                set rowElement to my safeParent(candidate)
+                if rowElement is not missing value then
+                    set rowItems to my boundedContents(rowElement)
+                    if my listHasRole(rowItems, "AXCheckBox") then set end of candidates to rowElement
+                end if
             end if
         end if
         if (count of candidates) ≥ 20 then exit repeat
@@ -545,9 +553,11 @@ on sameTextMultiset(leftList, rightList)
     if (count of leftList) is not (count of rightList) then return false
     set remainingValues to rightList
     repeat with leftValue in leftList
+        set canonicalLeftValue to my canonicalText(leftValue as text)
         set foundPosition to 0
         repeat with positionValue from 1 to (count of remainingValues)
-            if item positionValue of remainingValues is (leftValue as text) then
+            set canonicalRightValue to my canonicalText((item positionValue of remainingValues) as text)
+            if canonicalRightValue is canonicalLeftValue then
                 set foundPosition to positionValue
                 exit repeat
             end if
@@ -568,9 +578,15 @@ end sameTextMultiset
 
 on normalizedText(valueText)
     set foundationText to current application's NSMutableString's stringWithString:valueText
+    set crlfText to return & linefeed
+    foundationText's replaceOccurrencesOfString:crlfText withString:linefeed options:0 range:{location:0, |length|:foundationText's |length|()}
     foundationText's replaceOccurrencesOfString:return withString:linefeed options:0 range:{location:0, |length|:foundationText's |length|()}
-    return foundationText as text
+    return (foundationText's precomposedStringWithCanonicalMapping()) as text
 end normalizedText
+
+on canonicalText(valueText)
+    return ((current application's NSString's stringWithString:valueText)'s precomposedStringWithCanonicalMapping()) as text
+end canonicalText
 
 on lowercaseText(valueText)
     return (current application's NSString's stringWithString:valueText)'s lowercaseString() as text
