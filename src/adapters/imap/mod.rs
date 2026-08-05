@@ -1246,8 +1246,10 @@ fn is_exact_sent_candidate(
     observed_internal_date: Option<&DateTime<Utc>>,
     cutoff: &DateTime<Utc>,
 ) -> bool {
+    // Without INTERNALDATE there is no proof that a duplicate Message-ID is the
+    // message created by the just-completed send, so verification must fail closed.
     observed_message_id == Some(expected_message_id)
-        && observed_internal_date.is_none_or(|date| date >= cutoff)
+        && observed_internal_date.is_some_and(|date| date >= cutoff)
 }
 
 fn capability_name(capability: &async_imap::types::Capability) -> String {
@@ -1371,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_sent_identity_tolerates_only_a_missing_internal_date() {
+    fn exact_sent_identity_requires_a_recent_internal_date() {
         let cutoff = Utc
             .with_ymd_and_hms(2026, 8, 1, 12, 0, 0)
             .single()
@@ -1381,10 +1383,16 @@ mod tests {
             .single()
             .expect("valid older date");
 
-        assert!(is_exact_sent_candidate(
+        assert!(!is_exact_sent_candidate(
             Some("draft@example.com"),
             "draft@example.com",
             None,
+            &cutoff,
+        ));
+        assert!(is_exact_sent_candidate(
+            Some("draft@example.com"),
+            "draft@example.com",
+            Some(&cutoff),
             &cutoff,
         ));
         assert!(!is_exact_sent_candidate(
