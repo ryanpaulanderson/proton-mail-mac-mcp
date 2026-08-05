@@ -666,6 +666,35 @@ mod tests {
         );
     }
 
+    struct HealthProbeFailureRunner;
+
+    #[async_trait]
+    impl ScriptRunner for HealthProbeFailureRunner {
+        async fn run(&self, _script: &Path, request: &[u8]) -> Result<Vec<u8>, AppError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(request).expect("valid test request");
+            assert_eq!(
+                request.get("operation").and_then(|value| value.as_str()),
+                Some("health")
+            );
+            Ok(br#"{"version":1,"status":"ok","facts":{"application_installed":true,"application_running":true,"accessibility_authorized":true,"capability_probe_passed":false,"application_version":"1.13.3"}}"#.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn health_keeps_accessibility_state_when_capability_probe_fails() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let script = directory.path().join("ui.applescript");
+        install_embedded_script(&script).expect("install embedded script");
+        let adapter =
+            AppleScriptUi::new(script, Arc::new(HealthProbeFailureRunner)).expect("create adapter");
+
+        let health = adapter.health().await.expect("read health");
+
+        assert!(health.accessibility_authorized);
+        assert!(!health.capability_probe_passed);
+    }
+
     #[test]
     fn script_timeouts_are_operation_specific_and_bounded() {
         assert_eq!(
@@ -853,6 +882,11 @@ mod tests {
         assert!(source.contains("Remove "));
         assert!(source.contains("if visibleBody is not expectedNormalizedBody"));
         assert!(source.contains("precomposedStringWithCanonicalMapping"));
+        assert!(source.contains("if errorNumber is not 1702 then"));
+        assert!(
+            source
+                .contains("if errorNumber is not 1703 then error errorMessage number errorNumber")
+        );
         assert!(source.contains("if my subjectMatches(subjectText, candidateSubject) then"));
         assert!(source.contains("on subjectMatches(subjectText, candidateSubject)"));
         assert!(source.contains("return subjectText begins with prefixText"));

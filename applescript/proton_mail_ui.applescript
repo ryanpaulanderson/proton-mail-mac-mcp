@@ -91,14 +91,22 @@ on healthResponse()
         if (count of matchingProcesses) is 1 then set runningValue to true
     end tell
     if runningValue and accessibilityValue then
-        set targetWindow to my oneMainWindow(false)
-        set allItems to my boundedContents(targetWindow)
-        repeat with candidate in allItems
-            if my safeRole(candidate) is "AXWebArea" then
-                set probeValue to true
-                exit repeat
+        -- Permission and UI capability are separate facts; ambiguity is a failed probe.
+        try
+            set targetWindow to my oneMainWindow(false)
+            set allItems to my boundedContents(targetWindow)
+            repeat with candidate in allItems
+                if my safeRole(candidate) is "AXWebArea" then
+                    set probeValue to true
+                    exit repeat
+                end if
+            end repeat
+        on error errorMessage number errorNumber
+            if errorNumber is not 1702 then
+                if errorNumber is not 1703 then error errorMessage number errorNumber
             end if
-        end repeat
+            set probeValue to false
+        end try
     end if
     factsObject's setObject:installedValue forKey:"application_installed"
     factsObject's setObject:runningValue forKey:"application_running"
