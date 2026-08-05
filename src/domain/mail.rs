@@ -272,6 +272,7 @@ pub struct DraftPreview {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
     Sent,
+    Submitted,
     Cancelled,
     Unknown,
 }

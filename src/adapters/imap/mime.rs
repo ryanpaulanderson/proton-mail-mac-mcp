@@ -993,7 +993,7 @@ mod tests {
                 Vec::new(),
             )
             .expect("valid recipient set"),
-            subject: Subject::parse("Round trip").expect("valid subject"),
+            subject: Subject::parse("  Round trip  ").expect("valid subject"),
             body: PlainTextBody::parse("Exact body").expect("valid body"),
             attachments: vec![OutgoingAttachment {
                 canonical_path: path,
@@ -1018,6 +1018,7 @@ mod tests {
             Some(&content),
         )
         .expect("verify synchronized draft");
+        assert_eq!(content.subject.as_str(), "Round trip");
         assert_eq!(
             stored
                 .content

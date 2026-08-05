@@ -79,7 +79,11 @@ pub struct Subject(String);
 
 impl Subject {
     pub fn parse(value: impl Into<String>) -> Result<Self, AppError> {
+        // MIME header sanitization removes insignificant outer whitespace when
+        // a synchronized draft is reloaded, so canonicalize it before hashing
+        // or encoding the prepared subject.
         let value = value.into().nfc().collect::<String>();
+        let value = value.trim().to_owned();
         if value.len() > MAX_SUBJECT_BYTES
             || value
                 .chars()

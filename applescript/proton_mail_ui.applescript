@@ -170,11 +170,13 @@ on confirmAndSend(requestObject)
         try
             if my composerStillOpen(requestObject) is false then return "sent"
         on error
-            my raiseAdapterError(1706)
+            -- The Send press completed; an unobserved close is not proof of failure.
+            return "submitted"
         end try
         delay pollIntervalSeconds
     end repeat
-    my raiseAdapterError(1706)
+    -- Let Rust verify the exact Message-ID in Sent when the UI closes slowly.
+    return "submitted"
 end confirmAndSend
 
 on verifyComposer(requestObject)
@@ -221,7 +223,7 @@ on verifyRecipients(composerItems, expectedTo, expectedCc, expectedBcc)
             if my looksLikeEmail(helpText) then set end of observedAddresses to helpText
         end if
     end repeat
-    if my sameTextMultiset(observedAddresses, expectedCombined) is false then my raiseAdapterError(1705)
+    if my sameTextMultiset(observedAddresses, expectedCombined, true) is false then my raiseAdapterError(1705)
     repeat with addressText in expectedTo
         if my recipientHasLabel(composerItems, addressText as text, "to") is false then my raiseAdapterError(1705)
     end repeat
@@ -262,7 +264,7 @@ on verifyAttachments(composerRoot, expectedAttachments)
     set deadlineDate to (current date) + attachmentDetailsTimeoutSeconds
     repeat while (current date) < deadlineDate
         set observedAttachments to my attachmentNames(my boundedContents(composerRoot))
-        if my sameTextMultiset(observedAttachments, expectedAttachments) then return
+        if my sameTextMultiset(observedAttachments, expectedAttachments, false) then return
         delay pollIntervalSeconds
     end repeat
     my raiseAdapterError(1705)
@@ -580,14 +582,22 @@ on looksLikeEmail(valueText)
     return true
 end looksLikeEmail
 
-on sameTextMultiset(leftList, rightList)
+on sameTextMultiset(leftList, rightList, caseInsensitive)
     if (count of leftList) is not (count of rightList) then return false
     set remainingValues to rightList
     repeat with leftValue in leftList
-        set canonicalLeftValue to my canonicalText(leftValue as text)
+        if caseInsensitive then
+            set canonicalLeftValue to my canonicalAddress(leftValue as text)
+        else
+            set canonicalLeftValue to my canonicalText(leftValue as text)
+        end if
         set foundPosition to 0
         repeat with positionValue from 1 to (count of remainingValues)
-            set canonicalRightValue to my canonicalText((item positionValue of remainingValues) as text)
+            if caseInsensitive then
+                set canonicalRightValue to my canonicalAddress((item positionValue of remainingValues) as text)
+            else
+                set canonicalRightValue to my canonicalText((item positionValue of remainingValues) as text)
+            end if
             if canonicalRightValue is canonicalLeftValue then
                 set foundPosition to positionValue
                 exit repeat
@@ -618,6 +628,10 @@ end normalizedText
 on canonicalText(valueText)
     return ((current application's NSString's stringWithString:valueText)'s precomposedStringWithCanonicalMapping()) as text
 end canonicalText
+
+on canonicalAddress(valueText)
+    return my lowercaseText(my canonicalText(valueText))
+end canonicalAddress
 
 on lowercaseText(valueText)
     return (current application's NSString's stringWithString:valueText)'s lowercaseString() as text

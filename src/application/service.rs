@@ -554,7 +554,7 @@ impl MailApplication {
                 "send draft",
                 "Send outcome is uncertain. Check Sent before attempting another send.",
             )),
-            SendOutcome::Sent => {
+            SendOutcome::Sent | SendOutcome::Submitted => {
                 let verification = tokio::time::timeout(
                     SENT_VERIFICATION_TIMEOUT,
                     self.wait_until_sent(&draft.message_id, sent_after),
@@ -855,6 +855,21 @@ mod tests {
             ErrorCode::StaleRef
         );
         assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn submitted_ui_outcome_is_verified_in_sent() {
+        let fixture = Fixture::new(SendOutcome::Submitted, SentCheck::Found);
+        let preview = fixture.prepare().await;
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("verify submitted send");
+
+        assert_eq!(result.status, SendStatus::Sent);
+        assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -228,6 +228,7 @@ impl UiAutomation for AppleScriptUi {
         };
         match response.facts.and_then(|facts| facts.outcome) {
             Some(ScriptOutcome::Sent) => Ok(SendOutcome::Sent),
+            Some(ScriptOutcome::Submitted) => Ok(SendOutcome::Submitted),
             Some(ScriptOutcome::Cancelled) => Ok(SendOutcome::Cancelled),
             None => Err(AppError::new(
                 ErrorCode::SendUnknown,
@@ -306,6 +307,7 @@ struct ScriptFacts {
 #[serde(rename_all = "snake_case")]
 enum ScriptOutcome {
     Sent,
+    Submitted,
     Cancelled,
 }
 
@@ -740,6 +742,40 @@ mod tests {
         }
     }
 
+    struct SubmittedRunner;
+
+    #[async_trait]
+    impl ScriptRunner for SubmittedRunner {
+        async fn run(&self, _script: &Path, request: &[u8]) -> Result<Vec<u8>, AppError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(request).expect("valid test request");
+            assert_eq!(
+                request.get("operation").and_then(serde_json::Value::as_str),
+                Some("confirm_and_send")
+            );
+            Ok(br#"{"version":1,"status":"ok","facts":{"outcome":"submitted"}}"#.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_composer_close_is_verified_as_submitted() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let script = directory.path().join("ui.applescript");
+        install_embedded_script(&script).expect("install embedded script");
+        let adapter =
+            AppleScriptUi::new(script, Arc::new(SubmittedRunner)).expect("create adapter");
+        let now = DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .expect("valid fixed date")
+            .with_timezone(&Utc);
+
+        let outcome = adapter
+            .confirm_and_send(&test_draft(), now + TimeDelta::minutes(5))
+            .await
+            .expect("read submitted outcome");
+
+        assert_eq!(outcome, SendOutcome::Submitted);
+    }
+
     struct OpenDraftRunner;
 
     #[async_trait]
@@ -882,6 +918,9 @@ mod tests {
         assert!(source.contains("Remove "));
         assert!(source.contains("if visibleBody is not expectedNormalizedBody"));
         assert!(source.contains("precomposedStringWithCanonicalMapping"));
+        assert!(source.contains("return \"submitted\""));
+        assert!(source.contains("sameTextMultiset(observedAddresses, expectedCombined, true)"));
+        assert!(source.contains("on canonicalAddress(valueText)"));
         assert!(source.contains("if errorNumber is not 1702 then"));
         assert!(
             source
