@@ -1,9 +1,14 @@
 # ADR 0001: Bridge for mailbox data, visible Proton UI for sending
 
-- Status: Accepted
+- Status: Superseded by [ADR 0002](0002-bridge-imap-smtp.md)
 - Date: 2026-08-05
 
 ## Context
+
+This record preserves the original decision. The UI boundary was removed after
+live host-process testing showed that macOS TCC ownership made embedded
+Accessibility automation brittle for local MCP hosts, and the repository owner
+chose Bridge as the complete mail transport boundary.
 
 The tool needs reliable local mailbox access while preserving a visible,
 user-controlled send boundary in the Proton Mail macOS application. Proton Mail

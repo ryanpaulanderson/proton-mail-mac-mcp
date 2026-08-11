@@ -7,7 +7,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     adapters::{
-        applescript::{AppleScriptUi, OsascriptRunner, install_embedded_script},
         attachments::FileAttachmentManager,
         config::{
             AppConfig, AppPaths, AttachmentPolicyConfig, BridgeConfig, BridgeTlsMode, FolderRoles,
@@ -17,6 +16,7 @@ use crate::{
         keychain::KeychainSecretStore,
         platform::{SystemClock, SystemSecureRandom},
         references::EncryptedReferenceCodec,
+        smtp::BridgeSmtpSender,
     },
     application::{
         ports::{ConfigStore, SecretStore, SecureRandom},
@@ -72,6 +72,12 @@ struct ConfigureArgs {
     /// Bridge IMAP transport mode shown in Bridge settings.
     #[arg(long, value_enum, default_value_t = TlsModeArgument::StartTls)]
     tls_mode: TlsModeArgument,
+    /// Proton Mail Bridge SMTP port.
+    #[arg(long, default_value_t = 1025)]
+    smtp_port: u16,
+    /// Bridge SMTP transport mode shown in Bridge settings.
+    #[arg(long, value_enum, default_value_t = TlsModeArgument::ImplicitTls)]
+    smtp_tls_mode: TlsModeArgument,
     /// Hostname validated against the enrolled Bridge certificate.
     #[arg(long, default_value = "localhost")]
     tls_server_name: String,
@@ -108,6 +114,7 @@ pub async fn run() -> Result<(), AppError> {
 async fn configure(arguments: ConfigureArgs) -> Result<(), AppError> {
     let paths = AppPaths::discover()?;
     paths.create_private_directories()?;
+    paths.remove_legacy_ui_artifact()?;
 
     EmailAddress::parse(arguments.account.clone())?;
     EmailAddress::parse(arguments.bridge_username.clone())?;
@@ -142,6 +149,8 @@ async fn configure(arguments: ConfigureArgs) -> Result<(), AppError> {
             host: "127.0.0.1".to_owned(),
             imap_port: arguments.imap_port,
             tls_mode: arguments.tls_mode.into(),
+            smtp_port: arguments.smtp_port,
+            smtp_tls_mode: arguments.smtp_tls_mode.into(),
             tls_server_name: arguments.tls_server_name,
             certificate_sha256,
         },
@@ -171,7 +180,6 @@ async fn configure(arguments: ConfigureArgs) -> Result<(), AppError> {
 
     let store = TomlConfigStore::new(paths.config_file.clone());
     store.save(&config).await?;
-    install_embedded_script(&paths.ui_script)?;
     tracing::info!(
         "configuration installed; Bridge password and reference key are in macOS Keychain"
     );
@@ -196,12 +204,14 @@ impl From<TlsModeArgument> for BridgeTlsMode {
 async fn serve() -> Result<(), AppError> {
     let paths = AppPaths::discover()?;
     paths.create_private_directories()?;
-    install_embedded_script(&paths.ui_script)?;
-
+    paths.remove_legacy_ui_artifact()?;
     let config_store = TomlConfigStore::new(paths.config_file.clone());
     let config = config_store.load().await?;
     let secrets = KeychainSecretStore::new(KEYCHAIN_SERVICE)?;
     let bridge_password = secrets
+        .get(&bridge_password_key(&config.bridge.profile))
+        .await?;
+    let smtp_password = secrets
         .get(&bridge_password_key(&config.bridge.profile))
         .await?;
     let reference_key = secrets
@@ -216,6 +226,7 @@ async fn serve() -> Result<(), AppError> {
         bridge_password,
         random.clone(),
     )?);
+    let sender = Arc::new(BridgeSmtpSender::new(&config, &certificate, smtp_password)?);
     let references = Arc::new(EncryptedReferenceCodec::new(
         reference_key,
         &config.bridge.profile,
@@ -226,14 +237,10 @@ async fn serve() -> Result<(), AppError> {
         paths.downloads_dir,
         random.clone(),
     )?);
-    let ui = Arc::new(AppleScriptUi::new(
-        paths.ui_script,
-        Arc::new(OsascriptRunner),
-    )?);
     let account = config.account()?;
     let application = Arc::new(MailApplication::new(
         repository,
-        ui,
+        sender,
         references,
         attachments,
         Arc::new(SystemClock),
@@ -289,7 +296,7 @@ async fn read_bridge_password() -> Result<Zeroizing<String>, AppError> {
         ));
     }
     tokio::task::spawn_blocking(|| {
-        rpassword::prompt_password("Proton Mail Bridge IMAP password: ")
+        rpassword::prompt_password("Proton Mail Bridge password: ")
             .map(Zeroizing::new)
             .map_err(|error| {
                 AppError::with_source(
