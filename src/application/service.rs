@@ -91,14 +91,22 @@ pub enum SendStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DraftCleanupStatus {
-    MovedToTrash,
+    Cleaned,
+    AlreadyAbsent,
     AttentionRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftCleanupResult {
+    pub status: DraftCleanupStatus,
+    pub recovery_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SendResult {
     pub status: SendStatus,
     pub draft_cleanup: DraftCleanupStatus,
+    pub draft_cleanup_recovery: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -458,9 +466,12 @@ impl MailApplication {
         result
     }
 
-    pub async fn discard_draft(&self, draft_ref: &DraftRef) -> Result<(), AppError> {
+    pub async fn discard_draft(
+        &self,
+        draft_ref: &DraftRef,
+    ) -> Result<DraftCleanupResult, AppError> {
         let locator = self.references.decode_draft(draft_ref).await?;
-        self.repository.discard_draft(&locator).await
+        Ok(self.cleanup_draft(&locator).await)
     }
 
     pub async fn send_prepared(
@@ -534,24 +545,11 @@ impl MailApplication {
         .await;
         match verification {
             Ok(Ok(true)) => {
-                let draft_cleanup = match self
-                    .repository
-                    .discard_draft(&submission.draft.locator)
-                    .await
-                {
-                    Ok(()) => DraftCleanupStatus::MovedToTrash,
-                    Err(error) => {
-                        tracing::warn!(
-                            operation = "cleanup_sent_draft",
-                            error_code = ?error.code(),
-                            "sent message was verified but its source draft remains"
-                        );
-                        DraftCleanupStatus::AttentionRequired
-                    }
-                };
+                let cleanup = self.cleanup_draft(&submission.draft.locator).await;
                 Ok(SendResult {
                     status: SendStatus::Sent,
-                    draft_cleanup,
+                    draft_cleanup: cleanup.status,
+                    draft_cleanup_recovery: cleanup.recovery_guidance,
                 })
             }
             Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(AppError::new(
@@ -581,6 +579,41 @@ impl MailApplication {
                 return Ok(true);
             }
             tokio::time::sleep(SENT_VERIFICATION_POLL).await;
+        }
+    }
+
+    async fn cleanup_draft(&self, locator: &MessageLocator) -> DraftCleanupResult {
+        match self.repository.load_draft(locator).await {
+            Ok(_) => match self.repository.discard_draft(locator).await {
+                Ok(()) => draft_cleanup_result(DraftCleanupStatus::Cleaned),
+                Err(discard_error) => {
+                    let verification = self.repository.load_draft(locator).await;
+                    match verification {
+                        Err(error) if draft_is_absent(&error) => {
+                            draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent)
+                        }
+                        Ok(_) | Err(_) => {
+                            tracing::warn!(
+                                operation = "cleanup_draft",
+                                error_code = ?discard_error.code(),
+                                "draft cleanup remains unresolved"
+                            );
+                            unresolved_draft_cleanup()
+                        }
+                    }
+                }
+            },
+            Err(error) if draft_is_absent(&error) => {
+                draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    operation = "verify_draft_cleanup",
+                    error_code = ?error.code(),
+                    "draft cleanup state could not be verified"
+                );
+                unresolved_draft_cleanup()
+            }
         }
     }
 
@@ -720,6 +753,27 @@ impl MailApplication {
                 "draft cleanup could not be verified; inspect Drafts and Trash before retrying"
             );
         }
+    }
+}
+
+fn draft_is_absent(error: &AppError) -> bool {
+    matches!(error.code(), ErrorCode::NotFound | ErrorCode::StaleRef)
+}
+
+fn draft_cleanup_result(status: DraftCleanupStatus) -> DraftCleanupResult {
+    DraftCleanupResult {
+        status,
+        recovery_guidance: None,
+    }
+}
+
+fn unresolved_draft_cleanup() -> DraftCleanupResult {
+    DraftCleanupResult {
+        status: DraftCleanupStatus::AttentionRequired,
+        recovery_guidance: Some(
+            "Inspect Drafts and Trash for the source draft, then retry draft cleanup if it remains. If delivery was already verified, do not resend the message."
+                .to_owned(),
+        ),
     }
 }
 
@@ -883,7 +937,8 @@ mod tests {
             .await
             .expect("send exact prepared draft");
         assert_eq!(result.status, SendStatus::Sent);
-        assert_eq!(result.draft_cleanup, DraftCleanupStatus::MovedToTrash);
+        assert_eq!(result.draft_cleanup, DraftCleanupStatus::Cleaned);
+        assert_eq!(result.draft_cleanup_recovery, None);
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
 
         let replay = fixture
@@ -910,6 +965,121 @@ mod tests {
 
         assert_eq!(result.status, SendStatus::Sent);
         assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn already_missing_draft_cleanup_converges_without_mutation() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture.repository.remove_draft();
+
+        let first = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("classify missing draft");
+        let second = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("repeat missing draft cleanup");
+
+        assert_eq!(first.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(second.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_cleanup_after_send_is_safe_and_does_not_resend() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+
+        let sent = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("send and clean draft");
+        let repeated = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("repeat cleanup");
+
+        assert_eq!(sent.draft_cleanup, DraftCleanupStatus::Cleaned);
+        assert_eq!(repeated.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn send_reports_already_absent_when_bridge_removed_source_draft() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::RemoveDraftThenFound);
+        let preview = fixture.prepare().await;
+
+        let sent = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("verify send whose source draft is already absent");
+
+        assert_eq!(sent.status, SendStatus::Sent);
+        assert_eq!(sent.draft_cleanup, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(sent.draft_cleanup_recovery, None);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_partial_failure_is_verified_as_already_absent() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_discard_after_removal
+            .store(true, Ordering::SeqCst);
+
+        let sent = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("verified send remains successful");
+        let repeated = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("repeat cleanup after partial failure");
+
+        assert_eq!(sent.draft_cleanup, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(sent.draft_cleanup_recovery, None);
+        assert_eq!(repeated.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_interruption_returns_actionable_unresolved_cleanup() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_next_load(ErrorCode::BridgeUnavailable);
+
+        let cleanup = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("represent unresolved cleanup as a stable result");
+
+        assert_eq!(cleanup.status, DraftCleanupStatus::AttentionRequired);
+        assert!(
+            cleanup
+                .recovery_guidance
+                .as_deref()
+                .is_some_and(|guidance| guidance.contains("do not resend"))
+        );
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1114,6 +1284,12 @@ mod tests {
             .expect("sent result remains authoritative");
         assert_eq!(result.status, SendStatus::Sent);
         assert_eq!(result.draft_cleanup, DraftCleanupStatus::AttentionRequired);
+        assert!(
+            result
+                .draft_cleanup_recovery
+                .as_deref()
+                .is_some_and(|guidance| guidance.contains("do not resend"))
+        );
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
         assert!(fixture.repository.stored().is_ok());
@@ -1229,6 +1405,7 @@ mod tests {
     enum SentCheck {
         Found,
         FoundAfter(usize),
+        RemoveDraftThenFound,
         Fail,
     }
 
@@ -1247,6 +1424,7 @@ mod tests {
         created: AtomicUsize,
         discarded: AtomicUsize,
         fail_discard: AtomicBool,
+        fail_discard_after_removal: AtomicBool,
         load_failure: StdMutex<Option<ErrorCode>>,
         prepare_advance: StdMutex<Option<TimeDelta>>,
         clock: Arc<FixedClock>,
@@ -1263,6 +1441,7 @@ mod tests {
                 created: AtomicUsize::new(0),
                 discarded: AtomicUsize::new(0),
                 fail_discard: AtomicBool::new(false),
+                fail_discard_after_removal: AtomicBool::new(false),
                 load_failure: StdMutex::new(None),
                 prepare_advance: StdMutex::new(None),
                 clock,
@@ -1428,6 +1607,19 @@ mod tests {
 
         async fn discard_draft(&self, _locator: &MessageLocator) -> Result<(), AppError> {
             self.discarded.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_discard_after_removal
+                .swap(false, Ordering::SeqCst)
+            {
+                *self.draft.lock().map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "lock fake draft", "fake error")
+                })? = None;
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "verify fake draft discard",
+                    "fake error",
+                ));
+            }
             if self.fail_discard.load(Ordering::SeqCst) {
                 return Err(AppError::new(
                     ErrorCode::Conflict,
@@ -1451,6 +1643,12 @@ mod tests {
                 SentCheck::Found => Ok(true),
                 SentCheck::FoundAfter(attempt) => {
                     Ok(self.sent_checks.load(Ordering::SeqCst) >= *attempt)
+                }
+                SentCheck::RemoveDraftThenFound => {
+                    *self.draft.lock().map_err(|_| {
+                        AppError::new(ErrorCode::Internal, "lock fake draft", "fake error")
+                    })? = None;
+                    Ok(true)
                 }
                 SentCheck::Fail => Err(AppError::new(
                     ErrorCode::BridgeUnavailable,

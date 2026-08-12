@@ -89,7 +89,7 @@ sequenceDiagram
     A->>S: one authenticated SMTP transaction
     S-->>A: accepted, rejected, or uncertain
     A->>I: find exact Message-ID in Sent
-    A->>I: move source draft to Trash after verified send
+    A->>I: idempotently clean source draft after verified send
     A-->>C: sent + cleanup status, rejected, or send_unknown
 ```
 
@@ -124,8 +124,11 @@ After DATA begins, a write timeout, disconnect, malformed response, or missing
 final response is conservatively `send_unknown`; the server never retries it.
 A final SMTP rejection is `send_rejected`. A positive SMTP reply is not final
 success until IMAP finds exactly one recent Sent item with the prepared
-Message-ID. If source-draft cleanup then fails, the result remains `sent` and
-reports `attention_required` so callers do not retry a delivered message.
+Message-ID. Source-draft cleanup then converges on `cleaned` when this operation
+verifies the Trash move or `already_absent` when exact source absence is
+verified, including after an ambiguous move result. Only an unresolved state
+reports `attention_required`, with safe recovery guidance. The result remains
+`sent` in every cleanup case so callers never retry a delivered message.
 
 ## Persisted data
 

@@ -389,12 +389,12 @@ impl MailMcpServer {
 
     #[tool(
         name = "proton_discard_draft",
-        description = "Move one exact draft to Trash. Permanent deletion is not supported.",
+        description = "Idempotently move one exact draft to Trash. Returns cleaned when this call verifies the move, already_absent when the exact draft is already gone, or attention_required with safe recovery guidance when cleanup cannot be resolved. Permanent deletion is not supported.",
         annotations(
             title = "Move Proton Mail draft to Trash",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false,
+            idempotent_hint = true,
             open_world_hint = false
         )
     )]
@@ -408,9 +408,14 @@ impl MailMcpServer {
             Err(error) => return Err(self.failure("proton_discard_draft", error)),
         };
         match self.application.discard_draft(&draft_ref).await {
-            Ok(()) => {
+            Ok(cleanup) => {
                 self.success("proton_discard_draft");
-                Ok(Json(ActionResult { success: true }))
+                Ok(Json(ActionResult {
+                    success: cleanup.status
+                        != crate::application::service::DraftCleanupStatus::AttentionRequired,
+                    draft_cleanup: cleanup.status,
+                    recovery_guidance: cleanup.recovery_guidance,
+                }))
             }
             Err(error) => Err(self.failure("proton_discard_draft", error)),
         }
@@ -536,6 +541,8 @@ struct MutationResult {
 #[derive(Debug, Serialize, JsonSchema)]
 struct ActionResult {
     success: bool,
+    draft_cleanup: crate::application::service::DraftCleanupStatus,
+    recovery_guidance: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -915,6 +922,19 @@ mod tests {
             send.description
                 .as_deref()
                 .is_some_and(|description| description.contains("Bridge SMTP"))
+        );
+
+        let discard = tools
+            .iter()
+            .find(|tool| tool.name == "proton_discard_draft")
+            .expect("discard draft tool");
+        let discard_annotations = discard.annotations.as_ref().expect("discard annotations");
+        assert_eq!(discard_annotations.idempotent_hint, Some(true));
+        assert!(
+            discard
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("already_absent"))
         );
 
         let list = tools

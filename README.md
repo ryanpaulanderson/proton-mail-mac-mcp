@@ -162,8 +162,10 @@ returning mailbox content.
    reference and token. Any intervening draft change fails closed and requires
    a new preview.
 6. If the result is `send_unknown`, inspect Sent and do not retry blindly. A
-   successful result also reports whether the source draft moved to Trash or
-   still requires attention.
+   successful result also reports source-draft cleanup as `cleaned`,
+   `already_absent`, or `attention_required`. Cleanup can be retried safely with
+   `proton_discard_draft`; never resend a verified message because cleanup needs
+   attention.
 
 Token expiry, a changed or missing draft, a mismatched token/reference pair,
 and Bridge unavailability are reported separately with safe recovery guidance.
