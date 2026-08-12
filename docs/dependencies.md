@@ -33,15 +33,25 @@ substitute for the license texts shipped by dependencies.
   before application data is returned.
 - No dependency may write MCP diagnostics to stdout. Application tracing is
   restricted to this crate and emitted to stderr.
-- Dependabot evaluates Cargo and GitHub Actions nightly. Patch updates are not
-  auto-merged because security-sensitive behavior requires human review.
+- Dependabot evaluates Cargo and GitHub Actions nightly. Semver-patch updates
+  may be auto-merged by `.github/workflows/dependabot-auto-merge.yml` only when
+  the update is created by `dependabot[bot]`, the complete reported check set is
+  green and stable, and the repository's `CI / Quality and tests` check passes.
+  Minor, major, non-semver, failed, ambiguous, and stale updates remain for
+  human review.
 - GitHub Actions are pinned by full commit SHA. Cargo changes preserve the
   committed lockfile and must pass formatting, Clippy, tests, and AppleScript
   compilation.
 
+The auto-merge workflow runs on `pull_request_target` so it can inspect trusted
+repository checks and merge metadata without checking out or executing the
+Dependabot branch. Its write-capable job is gated by the bot identity, exact
+repository, patch-only metadata, stable checks, and the pull request head SHA.
+
 ## Update review checklist
 
-1. Read upstream release and security notes and confirm maintenance activity.
+1. For updates not covered by the patch auto-merge policy, read upstream
+   release and security notes and confirm maintenance activity.
 2. Inspect direct and newly introduced transitive licenses.
 3. Review changes in unsafe/native/TLS/IMAP/MIME/crypto transitive surfaces.
 4. Confirm MSRV remains Rust 1.88 and regenerate `Cargo.lock` intentionally.

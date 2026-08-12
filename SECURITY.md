@@ -63,6 +63,14 @@ Important enforced properties include:
   Message-ID verification in Sent; and
 - no blind retry when a send outcome is uncertain.
 
+Dependency updates are also constrained by a dedicated supply-chain control:
+Dependabot patch updates can be merged automatically only when the update is
+authored by the repository's Dependabot bot, the full reported check set is
+green and stable, the macOS `CI / Quality and tests` check passes, and the
+validated pull request head SHA still matches at merge time. The workflow does
+not check out or execute pull request code. Minor, major, non-semver, failed,
+ambiguous, or stale updates require human review.
+
 See [the architecture](docs/architecture.md), [the tool contract](docs/tool-reference.md),
 and [the compatibility matrix](docs/compatibility.md) for implementation and
 version details.
