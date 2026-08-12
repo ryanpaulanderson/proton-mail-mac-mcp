@@ -120,8 +120,10 @@ reports `attention_required` so callers do not retry a delivered message.
 
 - Strict versioned TOML, enrolled public Bridge certificate, and managed
   downloads live under the user's private Application Support directory.
-- Version-1 configuration without SMTP fields loads additively as port 1025
-  with implicit TLS. Unknown incompatible versions are rejected.
+- Version-1 configuration without SMTP fields loads additively as Bridge's
+  default port 1025 with STARTTLS. Users who changed Bridge's SMTP mode to SSL
+  must explicitly configure the matching implicit-TLS mode. Unknown
+  incompatible versions are rejected.
 - First start removes only the exact obsolete generated AppleScript file from
   the private support directory; an unexpected directory at that path fails
   closed and is never recursively removed.

@@ -76,7 +76,7 @@ struct ConfigureArgs {
     #[arg(long, default_value_t = 1025)]
     smtp_port: u16,
     /// Bridge SMTP transport mode shown in Bridge settings.
-    #[arg(long, value_enum, default_value_t = TlsModeArgument::ImplicitTls)]
+    #[arg(long, value_enum, default_value_t = TlsModeArgument::StartTls)]
     smtp_tls_mode: TlsModeArgument,
     /// Hostname validated against the enrolled Bridge certificate.
     #[arg(long, default_value = "localhost")]
@@ -457,6 +457,7 @@ mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
     use async_trait::async_trait;
+    use clap::Parser;
     use zeroize::Zeroizing;
 
     use crate::{
@@ -465,9 +466,29 @@ mod tests {
     };
 
     use super::{
-        canonical_allowed_roots, canonicalize_allowed_roots, ensure_reference_key,
-        reference_key_name, validate_bridge_password, validate_profile,
+        Cli, Command, TlsModeArgument, canonical_allowed_roots, canonicalize_allowed_roots,
+        ensure_reference_key, reference_key_name, validate_bridge_password, validate_profile,
     };
+
+    #[test]
+    fn configure_defaults_both_bridge_transports_to_starttls() {
+        let cli = Cli::try_parse_from([
+            "proton-mail-mac-mcp",
+            "configure",
+            "--account",
+            "alice@example.com",
+            "--bridge-username",
+            "alice@example.com",
+            "--certificate",
+            "/tmp/bridge-certificate.pem",
+        ])
+        .expect("parse configure arguments");
+        let Command::Configure(arguments) = cli.command else {
+            panic!("expected configure command");
+        };
+        assert!(matches!(arguments.tls_mode, TlsModeArgument::StartTls));
+        assert!(matches!(arguments.smtp_tls_mode, TlsModeArgument::StartTls));
+    }
 
     #[test]
     fn configuration_secrets_and_profiles_are_bounded() {

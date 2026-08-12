@@ -80,7 +80,7 @@ a stable location before adding that absolute path to an MCP client.
   --imap-port 1143 \
   --tls-mode start-tls \
   --smtp-port 1025 \
-  --smtp-tls-mode implicit-tls \
+  --smtp-tls-mode start-tls \
   --certificate /absolute/path/to/cert.pem
 ```
 
@@ -92,10 +92,11 @@ used. Run `configure --help` for custom folder mappings and the explicit
 reference-key rotation option.
 
 Existing version-1 configuration remains valid. Missing SMTP settings migrate
-additively to port `1025` with `implicit_tls`; re-run configure only when those
-values differ from Bridge. On first start, the Bridge-only release also removes
-the exact obsolete generated `proton_mail_ui.applescript` artifact from this
-application's private support directory; it never recursively deletes a path.
+additively to Bridge's defaults of port `1025` with `start_tls`; re-run
+configure with the mode shown in Bridge when it has been changed to SSL. On
+first start, the Bridge-only release also removes the exact obsolete generated
+`proton_mail_ui.applescript` artifact from this application's private support
+directory; it never recursively deletes a path.
 
 Configuration and the enrolled public certificate are stored with private
 permissions under:

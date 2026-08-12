@@ -23,8 +23,8 @@ keystrokes, the clipboard, or GUI subprocesses.
 The adapters require:
 
 - IPv4 loopback IMAP and SMTP on `127.0.0.1`;
-- independently configured STARTTLS or implicit TLS modes, with defaults of
-  IMAP 1143/STARTTLS and SMTP 1025/implicit TLS;
+- independently configured STARTTLS or implicit TLS modes, with Bridge defaults
+  of IMAP 1143/STARTTLS and SMTP 1025/STARTTLS;
 - a hostname-valid, enrolled self-signed certificate whose peer DER digest
   exactly matches the configured SHA-256 value;
 - the Bridge username/password credential for both protocols;

@@ -156,7 +156,7 @@ const fn default_smtp_port() -> u16 {
 }
 
 const fn default_smtp_tls_mode() -> BridgeTlsMode {
-    BridgeTlsMode::ImplicitTls
+    BridgeTlsMode::StartTls
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_version_one_config_defaults_to_starttls() {
+    fn legacy_version_one_config_defaults_both_transports_to_starttls() {
         let directory = tempfile::tempdir().expect("create test directory");
         let encoded = toml::to_string_pretty(&valid_config(directory.path()))
             .expect("encode configuration")
@@ -752,7 +752,7 @@ mod tests {
         let decoded: AppConfig = toml::from_str(&encoded).expect("decode legacy configuration");
         assert_eq!(decoded.bridge.tls_mode, BridgeTlsMode::StartTls);
         assert_eq!(decoded.bridge.smtp_port, 1025);
-        assert_eq!(decoded.bridge.smtp_tls_mode, BridgeTlsMode::ImplicitTls);
+        assert_eq!(decoded.bridge.smtp_tls_mode, BridgeTlsMode::StartTls);
         decoded.validate().expect("validate legacy configuration");
     }
 
