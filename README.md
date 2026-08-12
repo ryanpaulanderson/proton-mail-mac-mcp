@@ -21,7 +21,8 @@ AG or OpenAI.
 - Bridge credentials and the opaque-reference key live in macOS Keychain.
 - The server connects only to `127.0.0.1`, validates the enrolled Bridge
   certificate and hostname, and pins its SHA-256 digest.
-- Sending requires a 10-minute, single-use token bound to the exact account,
+- Sending requires a 10-minute, single-use token whose review window starts
+  when the preview is returned and is bound to the exact account,
   recipients, subject, body, and attachment bytes. The visible composer is
   re-read after native confirmation. Send is pressed at most once.
 - A `send_unknown` result must never be retried blindly. Inspect Sent first.
@@ -148,6 +149,10 @@ only the permissions requested by the ChatGPT/Codex host. Use
 5. Call `proton_send_prepared` with the matching draft reference and token.
 6. Confirm in the native macOS dialog. Any intervening content change fails
    closed and requires a new preview.
+
+Token expiry, a changed or missing draft, a mismatched token/reference pair,
+and Bridge unavailability are reported separately with safe recovery guidance.
+The token is consumed on every send attempt, including these failures.
 
 See the [tool reference](docs/tool-reference.md) for all 14 tools, limits, and
 stable error categories.

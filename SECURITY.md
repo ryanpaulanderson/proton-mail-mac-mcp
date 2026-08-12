@@ -56,12 +56,19 @@ Important enforced properties include:
 - static reviewed AppleScript with versioned JSON on stdin, bounded output,
   semantic Accessibility selectors, and no dynamic source, clipboard,
   keystrokes, coordinates, or shell commands;
-- a ten-minute, single-use, cryptographically random confirmation token bound
+- a ten-minute review window starting when the preview is returned, represented
+  by a single-use, cryptographically random confirmation token bound
   to the exact account, recipients, subject, normalized body, and attachment
   bytes;
 - visible native confirmation, a complete UI re-read, one Send press, and exact
   Message-ID verification in Sent; and
 - no blind retry when a send outcome is uncertain.
+
+Every send attempt consumes its token before external validation or UI effects.
+Expiry, changed or missing drafts, token/reference mismatch, and pre-send Bridge
+unavailability have distinct privacy-safe error categories. Once a send may
+have been submitted, failures collapse to `send_unknown` so callers inspect
+Sent instead of retrying.
 
 See [the architecture](docs/architecture.md), [the tool contract](docs/tool-reference.md),
 and [the compatibility matrix](docs/compatibility.md) for implementation and

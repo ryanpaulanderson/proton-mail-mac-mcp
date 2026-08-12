@@ -27,6 +27,7 @@ use super::ports::{
 
 const CURSOR_TTL: TimeDelta = TimeDelta::minutes(15);
 const CONFIRMATION_TTL: TimeDelta = TimeDelta::minutes(10);
+const EXPIRED_CONFIRMATION_RETENTION: TimeDelta = TimeDelta::hours(1);
 const BODY_PREVIEW_CHARS: usize = 500;
 const SENT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 const SENT_VERIFICATION_POLL: Duration = Duration::from_millis(500);
@@ -502,8 +503,9 @@ impl MailApplication {
         let now = self.clock.now();
         let record = {
             let mut confirmations = self.confirmations.lock().await;
-            confirmations.retain(|_, state| state.expires_at() > now);
-            confirmations.remove(&token_key(token.as_str()))
+            let record = confirmations.remove(&token_key(token.as_str()));
+            retain_classifiable_confirmations(&mut confirmations, now);
+            record
         }
         .and_then(|state| match state {
             ConfirmationState::Ready(record) => Some(record),
@@ -513,32 +515,43 @@ impl MailApplication {
             AppError::new(
                 ErrorCode::StaleRef,
                 "consume send confirmation",
-                "Prepared send token is expired, unknown, or already used.",
+                "Prepared send token is unknown or already used. Prepare the draft again before sending.",
             )
         })?;
 
-        if &record.draft_ref != draft_ref || record.expires_at <= now {
+        if record.expires_at <= now {
             return Err(AppError::new(
-                ErrorCode::StaleRef,
+                ErrorCode::TokenExpired,
                 "validate send confirmation",
-                "Prepared send token does not match this draft or has expired.",
+                "Prepared send token expired. Prepare the draft again and review the new preview before sending.",
+            ));
+        }
+        if &record.draft_ref != draft_ref {
+            return Err(AppError::new(
+                ErrorCode::TokenReferenceMismatch,
+                "validate send confirmation",
+                "Prepared send token does not match this draft reference. Use the draft reference and token returned by the same preview.",
             ));
         }
         let requested_locator = self.references.decode_draft(draft_ref).await?;
         if requested_locator != record.draft {
             return Err(AppError::new(
-                ErrorCode::StaleRef,
+                ErrorCode::TokenReferenceMismatch,
                 "validate draft reference",
-                "Draft reference no longer identifies the prepared draft.",
+                "Prepared send token does not match this draft reference. Use the draft reference and token returned by the same preview.",
             ));
         }
 
-        let draft = self.repository.load_draft(&record.draft).await?;
+        let draft = self
+            .repository
+            .load_draft(&record.draft)
+            .await
+            .map_err(classify_prepared_draft_load)?;
         if draft.content.confirmation_digest() != record.digest
             || draft.integrity_digest != record.integrity_digest
         {
             return Err(AppError::new(
-                ErrorCode::Conflict,
+                ErrorCode::DraftChanged,
                 "validate prepared draft",
                 "Draft changed after preview; prepare it again before sending.",
             ));
@@ -601,13 +614,21 @@ impl MailApplication {
         stored: StoredDraft,
         reservation: &ConfirmationReservation,
     ) -> Result<DraftPreview, AppError> {
-        if reservation.expires_at <= self.clock.now() {
+        let now = self.clock.now();
+        if reservation.expires_at <= now {
             return Err(AppError::new(
                 ErrorCode::StaleRef,
                 "finalize send confirmation",
                 "Prepared send reservation expired before the preview was ready.",
             ));
         }
+        let expires_at = now.checked_add_signed(CONFIRMATION_TTL).ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Internal,
+                "finalize send confirmation",
+                "Unable to create a send confirmation.",
+            )
+        })?;
         let draft_ref = self.references.encode_draft(&stored.locator).await?;
         let digest = stored.content.confirmation_digest();
         {
@@ -624,7 +645,7 @@ impl MailApplication {
                 draft_ref: draft_ref.clone(),
                 digest,
                 integrity_digest: stored.integrity_digest,
-                expires_at: reservation.expires_at,
+                expires_at,
             });
         }
 
@@ -650,7 +671,7 @@ impl MailApplication {
         Ok(DraftPreview {
             draft_ref,
             prepared_send_token: reservation.token.clone(),
-            expires_at: reservation.expires_at,
+            expires_at,
             from: stored.content.account.to_string(),
             to: addresses_to_strings(stored.content.recipients.to()),
             cc: addresses_to_strings(stored.content.recipients.cc()),
@@ -684,8 +705,12 @@ impl MailApplication {
             let encoded = URL_SAFE_NO_PAD.encode(token_bytes);
             let key = token_key(&encoded);
             let mut confirmations = self.confirmations.lock().await;
-            confirmations.retain(|_, state| state.expires_at() > now);
-            if confirmations.len() >= MAX_PENDING_CONFIRMATIONS {
+            retain_classifiable_confirmations(&mut confirmations, now);
+            let pending = confirmations
+                .values()
+                .filter(|state| state.expires_at() > now)
+                .count();
+            if pending >= MAX_PENDING_CONFIRMATIONS {
                 return Err(AppError::resource_limit(
                     "Too many prepared sends are pending; use or let an existing token expire.",
                 ));
@@ -719,6 +744,29 @@ impl MailApplication {
                 "draft cleanup could not be verified; inspect Drafts and Trash before retrying"
             );
         }
+    }
+}
+
+fn retain_classifiable_confirmations(
+    confirmations: &mut HashMap<[u8; 32], ConfirmationState>,
+    now: DateTime<Utc>,
+) {
+    confirmations.retain(|_, state| {
+        state
+            .expires_at()
+            .checked_add_signed(EXPIRED_CONFIRMATION_RETENTION)
+            .is_some_and(|purge_at| purge_at > now)
+    });
+}
+
+fn classify_prepared_draft_load(error: AppError) -> AppError {
+    match error.code() {
+        ErrorCode::NotFound | ErrorCode::StaleRef => AppError::new(
+            ErrorCode::DraftNotFound,
+            "load prepared draft",
+            "Prepared draft no longer exists. Prepare a new draft and review it before sending.",
+        ),
+        _ => error,
     }
 }
 
@@ -858,6 +906,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_send_survives_review_and_sent_sync_latency() {
+        let fixture = Fixture::new(SendOutcome::Submitted, SentCheck::FoundAfter(3));
+        fixture.ui.advance_while_opening(TimeDelta::minutes(6));
+        let preview = fixture.prepare().await;
+        fixture.clock.advance(TimeDelta::minutes(8));
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("send after bounded human review and Sent synchronization latency");
+
+        assert_eq!(result.status, SendStatus::Sent);
+        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn submitted_ui_outcome_is_verified_in_sent() {
         let fixture = Fixture::new(SendOutcome::Submitted, SentCheck::Found);
         let preview = fixture.prepare().await;
@@ -882,9 +948,11 @@ mod tests {
             .application
             .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
             .await;
+        let error = result.expect_err("reject changed draft");
+        assert_eq!(error.code(), ErrorCode::DraftChanged);
         assert_eq!(
-            result.expect_err("reject changed draft").code(),
-            ErrorCode::Conflict
+            error.public_message(),
+            "Draft changed after preview; prepare it again before sending."
         );
         assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
 
@@ -912,7 +980,7 @@ mod tests {
             result
                 .expect_err("reject changed hidden draft headers")
                 .code(),
-            ErrorCode::Conflict
+            ErrorCode::DraftChanged
         );
         assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
     }
@@ -922,13 +990,78 @@ mod tests {
         let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture.clock.advance(TimeDelta::minutes(11));
+        let _newer_preview = fixture.prepare().await;
         let result = fixture
             .application
             .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
             .await;
+        let error = result.expect_err("reject expired token");
+        assert_eq!(error.code(), ErrorCode::TokenExpired);
         assert_eq!(
-            result.expect_err("reject expired token").code(),
-            ErrorCode::StaleRef
+            error.public_message(),
+            "Prepared send token expired. Prepare the draft again and review the new preview before sending."
+        );
+        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mismatched_token_and_reference_have_stable_category() {
+        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        let other_ref = DraftRef::from_encoded("x".repeat(32));
+
+        let result = fixture
+            .application
+            .send_prepared(&other_ref, &preview.prepared_send_token)
+            .await;
+
+        let error = result.expect_err("reject mismatched token and draft reference");
+        assert_eq!(error.code(), ErrorCode::TokenReferenceMismatch);
+        assert_eq!(
+            error.public_message(),
+            "Prepared send token does not match this draft reference. Use the draft reference and token returned by the same preview."
+        );
+        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_prepared_draft_has_stable_category() {
+        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture.repository.remove_draft();
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await;
+
+        let error = result.expect_err("reject missing prepared draft");
+        assert_eq!(error.code(), ErrorCode::DraftNotFound);
+        assert_eq!(
+            error.public_message(),
+            "Prepared draft no longer exists. Prepare a new draft and review it before sending."
+        );
+        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_failure_loading_prepared_draft_is_preserved() {
+        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_next_load(ErrorCode::BridgeUnavailable);
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await;
+
+        let error = result.expect_err("report Bridge failure");
+        assert_eq!(error.code(), ErrorCode::BridgeUnavailable);
+        assert_eq!(
+            error.public_message(),
+            "Proton Mail Bridge is unavailable. Start Bridge and try preparing the draft again."
         );
         assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
     }
@@ -1066,13 +1199,15 @@ mod tests {
         fn new(outcome: SendOutcome, sent_check: SentCheck) -> Self {
             let locator = test_locator();
             let repository = Arc::new(FakeRepository::new(locator.clone(), sent_check));
+            let clock = Arc::new(FixedClock::new());
             let ui = Arc::new(FakeUi {
                 outcome,
                 open_count: AtomicUsize::new(0),
                 send_count: AtomicUsize::new(0),
                 fail_open: false,
+                open_advance: StdMutex::new(None),
+                clock: clock.clone(),
             });
-            let clock = Arc::new(FixedClock::new());
             let application = MailApplication::new(
                 repository.clone(),
                 ui.clone(),
@@ -1097,6 +1232,8 @@ mod tests {
                 open_count: AtomicUsize::new(0),
                 send_count: AtomicUsize::new(0),
                 fail_open: true,
+                open_advance: StdMutex::new(None),
+                clock: fixture.clock.clone(),
             });
             fixture.application = MailApplication::new(
                 fixture.repository.clone(),
@@ -1120,9 +1257,9 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
     enum SentCheck {
         Found,
+        FoundAfter(usize),
         Fail,
     }
 
@@ -1134,6 +1271,7 @@ mod tests {
         mutations: AtomicUsize,
         created: AtomicUsize,
         discarded: AtomicUsize,
+        load_failure: StdMutex<Option<ErrorCode>>,
     }
 
     impl FakeRepository {
@@ -1146,6 +1284,7 @@ mod tests {
                 mutations: AtomicUsize::new(0),
                 created: AtomicUsize::new(0),
                 discarded: AtomicUsize::new(0),
+                load_failure: StdMutex::new(None),
             }
         }
 
@@ -1160,6 +1299,18 @@ mod tests {
             let mut draft = self.draft.lock().expect("lock fake draft");
             if let Some(draft) = draft.as_mut() {
                 draft.integrity_digest = [7; 32];
+            }
+        }
+
+        fn remove_draft(&self) {
+            if let Ok(mut draft) = self.draft.lock() {
+                *draft = None;
+            }
+        }
+
+        fn fail_next_load(&self, code: ErrorCode) {
+            if let Ok(mut failure) = self.load_failure.lock() {
+                *failure = Some(code);
             }
         }
 
@@ -1250,6 +1401,19 @@ mod tests {
         }
 
         async fn load_draft(&self, locator: &MessageLocator) -> Result<StoredDraft, AppError> {
+            if let Some(code) = self
+                .load_failure
+                .lock()
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake failure", "fake error"))?
+                .take()
+            {
+                let message = if code == ErrorCode::BridgeUnavailable {
+                    "Proton Mail Bridge is unavailable. Start Bridge and try preparing the draft again."
+                } else {
+                    "fake error"
+                };
+                return Err(AppError::new(code, "load fake draft", message));
+            }
             if locator != &self.locator {
                 return Err(AppError::new(
                     ErrorCode::StaleRef,
@@ -1274,8 +1438,11 @@ mod tests {
             _sent_after: DateTime<Utc>,
         ) -> Result<bool, AppError> {
             self.sent_checks.fetch_add(1, Ordering::SeqCst);
-            match self.sent_check {
+            match &self.sent_check {
                 SentCheck::Found => Ok(true),
+                SentCheck::FoundAfter(attempt) => {
+                    Ok(self.sent_checks.load(Ordering::SeqCst) >= *attempt)
+                }
                 SentCheck::Fail => Err(AppError::new(
                     ErrorCode::BridgeUnavailable,
                     "check fake Sent",
@@ -1290,6 +1457,16 @@ mod tests {
         open_count: AtomicUsize,
         send_count: AtomicUsize,
         fail_open: bool,
+        open_advance: StdMutex<Option<TimeDelta>>,
+        clock: Arc<FixedClock>,
+    }
+
+    impl FakeUi {
+        fn advance_while_opening(&self, delta: TimeDelta) {
+            if let Ok(mut advance) = self.open_advance.lock() {
+                *advance = Some(delta);
+            }
+        }
     }
 
     #[async_trait]
@@ -1306,6 +1483,14 @@ mod tests {
 
         async fn open_draft(&self, _draft: &StoredDraft) -> Result<(), AppError> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(delta) = self
+                .open_advance
+                .lock()
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake UI", "fake error"))?
+                .take()
+            {
+                self.clock.advance(delta);
+            }
             if self.fail_open {
                 Err(AppError::new(
                     ErrorCode::UiUnavailable,

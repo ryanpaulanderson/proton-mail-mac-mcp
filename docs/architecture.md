@@ -77,11 +77,12 @@ sequenceDiagram
     participant U as Proton Mail UI
 
     C->>A: prepare draft(validated exact content)
-    A->>A: reserve bounded 10-minute token
+    A->>A: reserve bounded preparation slot
     A->>B: APPEND MIME with random Message-ID and Draft flag
     B-->>A: exact synced draft locator
     A->>U: open exact internal draft ID
     U-->>A: composer visible
+    A->>A: start bounded 10-minute review window
     A-->>C: preview + draft_ref + single-use token
     C->>A: send_prepared(draft_ref, token)
     A->>A: consume token before side effects
@@ -99,8 +100,19 @@ account, To/CC/BCC lists, subject, normalized plain-text body, and each
 attachment's display name, media type, size, and SHA-256 digest. A separate
 stored-draft integrity digest also binds the exact Message-ID, In-Reply-To, and References
 headers so hidden thread changes invalidate the send. Tokens contain 256 random
-bits, are stored only by SHA-256 lookup key, expire after ten minutes, and are
-consumed before draft/UI validation. At most 64 can be pending.
+bits, are stored only by SHA-256 lookup key, and expire ten minutes after the
+preview becomes ready, so Bridge synchronization and opening the composer do
+not consume human review time. Tokens are consumed before draft/UI validation.
+Expired records are retained for one bounded hour solely to classify a later
+attempt as `token_expired`; only lookup digests and non-content lifecycle state
+are retained. At most 64 unexpired preparations can be pending.
+
+Send validation reports `token_expired`, `token_reference_mismatch`,
+`draft_changed`, `draft_not_found`, and `bridge_unavailable` separately. The
+first four remain fail-closed and require a fresh preview where indicated.
+Bridge errors before the UI action are safe to diagnose but the consumed token
+still cannot be replayed. Once the UI may have pressed Send, every Bridge or
+verification failure becomes `send_unknown` and the application never retries.
 
 The AppleScript receives exact values as versioned JSON on standard input.
 Runtime values are never interpolated into executable source, arguments,

@@ -418,7 +418,7 @@ impl MailMcpServer {
 
     #[tool(
         name = "proton_send_prepared",
-        description = "Request one send of the exact unchanged prepared draft. Consumes the short-lived token before validation, shows a native macOS confirmation, re-reads the compose UI, clicks Send at most once, and verifies the Message-ID in Sent. Never retry a send_unknown result.",
+        description = "Request one send of the exact unchanged prepared draft. The 10-minute review window starts when the preview is returned. The token is consumed before draft validation or UI effects. Expired tokens, changed or missing drafts, token/reference mismatches, and Bridge unavailability have distinct error categories. Shows a native macOS confirmation, re-reads the compose UI, clicks Send at most once, and verifies the Message-ID in Sent. Never retry a send_unknown result.",
         annotations(
             title = "Confirm and send Proton Mail draft",
             read_only_hint = false,
