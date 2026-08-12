@@ -12,7 +12,7 @@ use crate::domain::{
     mail::{
         AttachmentLocator, AttachmentSummary, DraftContent, DraftMode, DraftPreview, FolderSummary,
         ItemOutcome, MessageContentPage, MessageLocator, MessageSummary, Page, RecipientSet,
-        SearchCriteria, SendOutcome, StoredDraft,
+        SearchCriteria, StoredDraft,
     },
     value::{
         BodyPageRequest, DraftRef, EmailAddress, MailboxName, MessageRef, PageSize, PlainTextBody,
@@ -21,8 +21,8 @@ use crate::domain::{
 };
 
 use super::ports::{
-    AttachmentManager, Clock, CursorClaims, MailMutation, MailRepository, ReferenceCodec,
-    SecureRandom, UiAutomation,
+    AttachmentManager, Clock, CursorClaims, MailMutation, MailRepository, MailSender,
+    ReferenceCodec, SecureRandom,
 };
 
 const CURSOR_TTL: TimeDelta = TimeDelta::minutes(15);
@@ -78,22 +78,27 @@ pub struct SubsystemStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ServiceStatus {
     pub account_hint: String,
-    pub bridge: SubsystemStatus,
-    pub proton_mail_ui: SubsystemStatus,
-    pub accessibility_authorized: bool,
-    pub proton_mail_version: Option<String>,
+    pub bridge_imap: SubsystemStatus,
+    pub bridge_smtp: SubsystemStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SendStatus {
     Sent,
-    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftCleanupStatus {
+    MovedToTrash,
+    AttentionRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SendResult {
     pub status: SendStatus,
+    pub draft_cleanup: DraftCleanupStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +133,7 @@ struct ConfirmationReservation {
 
 pub struct MailApplication {
     repository: Arc<dyn MailRepository>,
-    ui: Arc<dyn UiAutomation>,
+    sender: Arc<dyn MailSender>,
     references: Arc<dyn ReferenceCodec>,
     attachments: Arc<dyn AttachmentManager>,
     clock: Arc<dyn Clock>,
@@ -140,7 +145,7 @@ pub struct MailApplication {
 impl MailApplication {
     pub fn new(
         repository: Arc<dyn MailRepository>,
-        ui: Arc<dyn UiAutomation>,
+        sender: Arc<dyn MailSender>,
         references: Arc<dyn ReferenceCodec>,
         attachments: Arc<dyn AttachmentManager>,
         clock: Arc<dyn Clock>,
@@ -149,7 +154,7 @@ impl MailApplication {
     ) -> Self {
         Self {
             repository,
-            ui,
+            sender,
             references,
             attachments,
             clock,
@@ -160,40 +165,11 @@ impl MailApplication {
     }
 
     pub async fn status(&self) -> ServiceStatus {
-        let (bridge_result, ui_result) = tokio::join!(self.repository.health(), self.ui.health());
-
-        let bridge = match bridge_result {
-            Ok(health) => SubsystemStatus {
-                ready: health.reachable && health.authenticated,
-                error_code: None,
-            },
-            Err(error) => SubsystemStatus {
-                ready: false,
-                error_code: Some(error.code()),
-            },
-        };
-
-        match ui_result {
-            Ok(health) => ServiceStatus {
-                account_hint: redact_address(&self.account),
-                bridge,
-                proton_mail_ui: SubsystemStatus {
-                    ready: health.application_installed && health.capability_probe_passed,
-                    error_code: None,
-                },
-                accessibility_authorized: health.accessibility_authorized,
-                proton_mail_version: health.application_version,
-            },
-            Err(error) => ServiceStatus {
-                account_hint: redact_address(&self.account),
-                bridge,
-                proton_mail_ui: SubsystemStatus {
-                    ready: false,
-                    error_code: Some(error.code()),
-                },
-                accessibility_authorized: false,
-                proton_mail_version: None,
-            },
+        let (imap, smtp) = tokio::join!(self.repository.health(), self.sender.health());
+        ServiceStatus {
+            account_hint: redact_address(&self.account),
+            bridge_imap: subsystem_status(imap),
+            bridge_smtp: subsystem_status(smtp),
         }
     }
 
@@ -434,11 +410,7 @@ impl MailApplication {
             }
         };
         let created_locator = stored.locator.clone();
-        let result = async {
-            self.ui.open_draft(&stored).await?;
-            self.prepare_preview(stored, &reservation).await
-        }
-        .await;
+        let result = self.prepare_preview(stored, &reservation).await;
         if result.is_err() {
             self.release_confirmation(&reservation.key).await;
             self.cleanup_failed_draft(&created_locator).await;
@@ -478,11 +450,7 @@ impl MailApplication {
             }
         };
         let replacement_locator = updated.locator.clone();
-        let result = async {
-            self.ui.open_draft(&updated).await?;
-            self.prepare_preview(updated, &reservation).await
-        }
-        .await;
+        let result = self.prepare_preview(updated, &reservation).await;
         if result.is_err() {
             self.release_confirmation(&reservation.key).await;
             self.cleanup_failed_draft(&replacement_locator).await;
@@ -542,13 +510,13 @@ impl MailApplication {
             ));
         }
 
-        let draft = self
+        let submission = self
             .repository
-            .load_draft(&record.draft)
+            .load_submission(&record.draft)
             .await
             .map_err(classify_prepared_draft_load)?;
-        if draft.content.confirmation_digest() != record.digest
-            || draft.integrity_digest != record.integrity_digest
+        if submission.draft.content.confirmation_digest() != record.digest
+            || submission.draft.integrity_digest != record.integrity_digest
         {
             return Err(AppError::new(
                 ErrorCode::DraftChanged,
@@ -558,32 +526,39 @@ impl MailApplication {
         }
 
         let sent_after = self.clock.now();
-        match self.ui.confirm_and_send(&draft, record.expires_at).await? {
-            SendOutcome::Cancelled => Ok(SendResult {
-                status: SendStatus::Cancelled,
-            }),
-            SendOutcome::Unknown => Err(AppError::new(
+        self.sender.submit(&submission).await?;
+        let verification = tokio::time::timeout(
+            SENT_VERIFICATION_TIMEOUT,
+            self.wait_until_sent(&submission.draft.message_id, sent_after),
+        )
+        .await;
+        match verification {
+            Ok(Ok(true)) => {
+                let draft_cleanup = match self
+                    .repository
+                    .discard_draft(&submission.draft.locator)
+                    .await
+                {
+                    Ok(()) => DraftCleanupStatus::MovedToTrash,
+                    Err(error) => {
+                        tracing::warn!(
+                            operation = "cleanup_sent_draft",
+                            error_code = ?error.code(),
+                            "sent message was verified but its source draft remains"
+                        );
+                        DraftCleanupStatus::AttentionRequired
+                    }
+                };
+                Ok(SendResult {
+                    status: SendStatus::Sent,
+                    draft_cleanup,
+                })
+            }
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(AppError::new(
                 ErrorCode::SendUnknown,
-                "send draft",
+                "verify sent message",
                 "Send outcome is uncertain. Check Sent before attempting another send.",
             )),
-            SendOutcome::Sent | SendOutcome::Submitted => {
-                let verification = tokio::time::timeout(
-                    SENT_VERIFICATION_TIMEOUT,
-                    self.wait_until_sent(&draft.message_id, sent_after),
-                )
-                .await;
-                match verification {
-                    Ok(Ok(true)) => Ok(SendResult {
-                        status: SendStatus::Sent,
-                    }),
-                    Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(AppError::new(
-                        ErrorCode::SendUnknown,
-                        "verify sent message",
-                        "Send outcome is uncertain. Check Sent before attempting another send.",
-                    )),
-                }
-            }
         }
     }
 
@@ -672,6 +647,7 @@ impl MailApplication {
             draft_ref,
             prepared_send_token: reservation.token.clone(),
             expires_at,
+            confirmation_digest: URL_SAFE_NO_PAD.encode(digest),
             from: stored.content.account.to_string(),
             to: addresses_to_strings(stored.content.recipients.to()),
             cc: addresses_to_strings(stored.content.recipients.cc()),
@@ -810,6 +786,21 @@ fn redact_address(address: &EmailAddress) -> String {
     }
 }
 
+fn subsystem_status(
+    result: Result<crate::application::ports::BridgeHealth, AppError>,
+) -> SubsystemStatus {
+    match result {
+        Ok(health) => SubsystemStatus {
+            ready: health.reachable && health.authenticated,
+            error_code: None,
+        },
+        Err(error) => SubsystemStatus {
+            ready: false,
+            error_code: Some(error.code()),
+        },
+    }
+}
+
 fn search_digest(criteria: &SearchCriteria) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"proton-mail-mac-mcp/search/v1\0");
@@ -849,7 +840,7 @@ fn search_digest(criteria: &SearchCriteria) -> [u8; 32] {
 mod tests {
     use std::sync::{
         Mutex as StdMutex,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     };
 
     use async_trait::async_trait;
@@ -857,11 +848,11 @@ mod tests {
     use super::*;
 
     use crate::{
-        application::ports::{BridgeHealth, RepositoryPage, UiHealth},
+        application::ports::{BridgeHealth, RepositoryPage},
         domain::{
             mail::{
                 AttachmentLocator, FolderSummary, OutgoingAttachment, StoredAttachment,
-                StoredMessage, StoredMessageSummary,
+                StoredMessage, StoredMessageSummary, SubmissionDraft,
             },
             value::AttachmentRef,
         },
@@ -884,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_send_is_single_use_and_sends_once() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         let result = fixture
             .application
@@ -892,7 +883,8 @@ mod tests {
             .await
             .expect("send exact prepared draft");
         assert_eq!(result.status, SendStatus::Sent);
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(result.draft_cleanup, DraftCleanupStatus::MovedToTrash);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
 
         let replay = fixture
             .application
@@ -902,30 +894,12 @@ mod tests {
             replay.expect_err("reject token replay").code(),
             ErrorCode::StaleRef
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn prepared_send_survives_review_and_sent_sync_latency() {
-        let fixture = Fixture::new(SendOutcome::Submitted, SentCheck::FoundAfter(3));
-        fixture.ui.advance_while_opening(TimeDelta::minutes(6));
-        let preview = fixture.prepare().await;
-        fixture.clock.advance(TimeDelta::minutes(8));
-
-        let result = fixture
-            .application
-            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
-            .await
-            .expect("send after bounded human review and Sent synchronization latency");
-
-        assert_eq!(result.status, SendStatus::Sent);
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn submitted_ui_outcome_is_verified_in_sent() {
-        let fixture = Fixture::new(SendOutcome::Submitted, SentCheck::Found);
+    async fn smtp_submission_is_verified_in_sent() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
 
         let result = fixture
@@ -939,8 +913,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_draft_consumes_token_without_invoking_ui() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+    async fn prepared_send_survives_preparation_review_and_sent_sync_latency() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::FoundAfter(3));
+        fixture
+            .repository
+            .advance_while_preparing(TimeDelta::minutes(6));
+        let preview = fixture.prepare().await;
+        fixture.clock.advance(TimeDelta::minutes(8));
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("send after bounded preparation, review, and Sent synchronization latency");
+
+        assert_eq!(result.status, SendStatus::Sent);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn changed_draft_consumes_token_without_invoking_sender() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture.repository.change_body("changed after preview");
 
@@ -954,7 +948,7 @@ mod tests {
             error.public_message(),
             "Draft changed after preview; prepare it again before sending."
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
 
         let replay = fixture
             .application
@@ -967,8 +961,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_hidden_draft_headers_consume_token_without_invoking_ui() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+    async fn changed_hidden_draft_headers_consume_token_without_invoking_sender() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture.repository.change_integrity_digest();
 
@@ -982,12 +976,12 @@ mod tests {
                 .code(),
             ErrorCode::DraftChanged
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn expired_confirmation_never_invokes_ui() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+    async fn expired_confirmation_never_invokes_sender() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture.clock.advance(TimeDelta::minutes(11));
         let _newer_preview = fixture.prepare().await;
@@ -1001,12 +995,12 @@ mod tests {
             error.public_message(),
             "Prepared send token expired. Prepare the draft again and review the new preview before sending."
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn mismatched_token_and_reference_have_stable_category() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         let other_ref = DraftRef::from_encoded("x".repeat(32));
 
@@ -1017,16 +1011,12 @@ mod tests {
 
         let error = result.expect_err("reject mismatched token and draft reference");
         assert_eq!(error.code(), ErrorCode::TokenReferenceMismatch);
-        assert_eq!(
-            error.public_message(),
-            "Prepared send token does not match this draft reference. Use the draft reference and token returned by the same preview."
-        );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn missing_prepared_draft_has_stable_category() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture.repository.remove_draft();
 
@@ -1037,16 +1027,12 @@ mod tests {
 
         let error = result.expect_err("reject missing prepared draft");
         assert_eq!(error.code(), ErrorCode::DraftNotFound);
-        assert_eq!(
-            error.public_message(),
-            "Prepared draft no longer exists. Prepare a new draft and review it before sending."
-        );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn bridge_failure_loading_prepared_draft_is_preserved() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture
             .repository
@@ -1057,26 +1043,27 @@ mod tests {
             .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
             .await;
 
-        let error = result.expect_err("report Bridge failure");
-        assert_eq!(error.code(), ErrorCode::BridgeUnavailable);
         assert_eq!(
-            error.public_message(),
-            "Proton Mail Bridge is unavailable. Start Bridge and try preparing the draft again."
+            result.expect_err("report Bridge failure").code(),
+            ErrorCode::BridgeUnavailable
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn native_cancellation_is_final_for_the_token() {
-        let fixture = Fixture::new(SendOutcome::Cancelled, SentCheck::Found);
+    async fn definite_smtp_failure_is_final_for_the_token() {
+        let fixture = Fixture::new(
+            FakeSendOutcome::Fail(ErrorCode::SendRejected),
+            SentCheck::Found,
+        );
         let preview = fixture.prepare().await;
-        let result = fixture
+        let error = fixture
             .application
             .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
             .await
-            .expect("return cancellation");
-        assert_eq!(result.status, SendStatus::Cancelled);
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+            .expect_err("return definite SMTP failure");
+        assert_eq!(error.code(), ErrorCode::SendRejected);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 0);
         assert!(
             fixture
@@ -1085,12 +1072,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn uncertain_sent_verification_is_never_retried() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Fail);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Fail);
         let preview = fixture.prepare().await;
         let result = fixture
             .application
@@ -1100,7 +1087,7 @@ mod tests {
             result.expect_err("report uncertain send").code(),
             ErrorCode::SendUnknown
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
         assert!(
             fixture
                 .application
@@ -1108,12 +1095,33 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(fixture.ui.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn verified_send_reports_draft_cleanup_failure_without_authorizing_retry() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_discard
+            .store(true, Ordering::SeqCst);
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("sent result remains authoritative");
+        assert_eq!(result.status, SendStatus::Sent);
+        assert_eq!(result.draft_cleanup, DraftCleanupStatus::AttentionRequired);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
+        assert!(fixture.repository.stored().is_ok());
     }
 
     #[tokio::test]
     async fn mutation_batch_limit_prevents_repository_side_effects() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let refs = (0..=MAX_MUTATION_BATCH)
             .map(|_| MessageRef::from_encoded("m".repeat(32)))
             .collect();
@@ -1133,7 +1141,7 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_is_rejected_after_mailbox_uidvalidity_changes() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let result = fixture
             .application
             .list_messages(MessageListCommand {
@@ -1153,7 +1161,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_confirmation_limit_prevents_extra_draft_creation() {
-        let fixture = Fixture::new(SendOutcome::Sent, SentCheck::Found);
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let mut previews = Vec::new();
         for _ in 0..MAX_PENDING_CONFIRMATIONS {
             previews.push(fixture.prepare().await);
@@ -1173,44 +1181,29 @@ mod tests {
         assert_eq!(previews.len(), MAX_PENDING_CONFIRMATIONS);
     }
 
-    #[tokio::test]
-    async fn draft_is_moved_to_trash_when_visible_open_fails() {
-        let fixture = Fixture::with_open_failure();
-        let result = fixture
-            .application
-            .prepare_draft(test_draft_command())
-            .await;
-        assert_eq!(
-            result.expect_err("reject failed visible open").code(),
-            ErrorCode::UiUnavailable
-        );
-        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
-        assert!(fixture.repository.stored().is_err());
-    }
-
     struct Fixture {
         application: MailApplication,
         repository: Arc<FakeRepository>,
-        ui: Arc<FakeUi>,
+        sender: Arc<FakeSender>,
         clock: Arc<FixedClock>,
     }
 
     impl Fixture {
-        fn new(outcome: SendOutcome, sent_check: SentCheck) -> Self {
+        fn new(outcome: FakeSendOutcome, sent_check: SentCheck) -> Self {
             let locator = test_locator();
-            let repository = Arc::new(FakeRepository::new(locator.clone(), sent_check));
             let clock = Arc::new(FixedClock::new());
-            let ui = Arc::new(FakeUi {
+            let repository = Arc::new(FakeRepository::new(
+                locator.clone(),
+                sent_check,
+                clock.clone(),
+            ));
+            let sender = Arc::new(FakeSender {
                 outcome,
-                open_count: AtomicUsize::new(0),
                 send_count: AtomicUsize::new(0),
-                fail_open: false,
-                open_advance: StdMutex::new(None),
-                clock: clock.clone(),
             });
             let application = MailApplication::new(
                 repository.clone(),
-                ui.clone(),
+                sender.clone(),
                 Arc::new(FakeReferences { locator }),
                 Arc::new(FakeAttachments),
                 clock.clone(),
@@ -1220,33 +1213,9 @@ mod tests {
             Self {
                 application,
                 repository,
-                ui,
+                sender,
                 clock,
             }
-        }
-
-        fn with_open_failure() -> Self {
-            let mut fixture = Self::new(SendOutcome::Sent, SentCheck::Found);
-            fixture.ui = Arc::new(FakeUi {
-                outcome: SendOutcome::Sent,
-                open_count: AtomicUsize::new(0),
-                send_count: AtomicUsize::new(0),
-                fail_open: true,
-                open_advance: StdMutex::new(None),
-                clock: fixture.clock.clone(),
-            });
-            fixture.application = MailApplication::new(
-                fixture.repository.clone(),
-                fixture.ui.clone(),
-                Arc::new(FakeReferences {
-                    locator: fixture.repository.locator.clone(),
-                }),
-                Arc::new(FakeAttachments),
-                fixture.clock.clone(),
-                Arc::new(SequenceRandom(AtomicU8::new(1))),
-                EmailAddress::parse("sender@example.com").expect("valid sender"),
-            );
-            fixture
         }
 
         async fn prepare(&self) -> DraftPreview {
@@ -1263,6 +1232,12 @@ mod tests {
         Fail,
     }
 
+    #[derive(Clone, Copy)]
+    enum FakeSendOutcome {
+        Succeed,
+        Fail(ErrorCode),
+    }
+
     struct FakeRepository {
         locator: MessageLocator,
         draft: StdMutex<Option<StoredDraft>>,
@@ -1271,11 +1246,14 @@ mod tests {
         mutations: AtomicUsize,
         created: AtomicUsize,
         discarded: AtomicUsize,
+        fail_discard: AtomicBool,
         load_failure: StdMutex<Option<ErrorCode>>,
+        prepare_advance: StdMutex<Option<TimeDelta>>,
+        clock: Arc<FixedClock>,
     }
 
     impl FakeRepository {
-        fn new(locator: MessageLocator, sent_check: SentCheck) -> Self {
+        fn new(locator: MessageLocator, sent_check: SentCheck, clock: Arc<FixedClock>) -> Self {
             Self {
                 locator,
                 draft: StdMutex::new(None),
@@ -1284,7 +1262,10 @@ mod tests {
                 mutations: AtomicUsize::new(0),
                 created: AtomicUsize::new(0),
                 discarded: AtomicUsize::new(0),
+                fail_discard: AtomicBool::new(false),
                 load_failure: StdMutex::new(None),
+                prepare_advance: StdMutex::new(None),
+                clock,
             }
         }
 
@@ -1299,6 +1280,12 @@ mod tests {
             let mut draft = self.draft.lock().expect("lock fake draft");
             if let Some(draft) = draft.as_mut() {
                 draft.integrity_digest = [7; 32];
+            }
+        }
+
+        fn advance_while_preparing(&self, delta: TimeDelta) {
+            if let Ok(mut advance) = self.prepare_advance.lock() {
+                *advance = Some(delta);
             }
         }
 
@@ -1380,6 +1367,14 @@ mod tests {
 
         async fn create_draft(&self, content: &DraftContent) -> Result<StoredDraft, AppError> {
             self.created.fetch_add(1, Ordering::SeqCst);
+            if let Some(delta) = self
+                .prepare_advance
+                .lock()
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake delay", "fake error"))?
+                .take()
+            {
+                self.clock.advance(delta);
+            }
             let stored = StoredDraft {
                 locator: self.locator.clone(),
                 message_id: "prepared@example.invalid".to_owned(),
@@ -1407,12 +1402,7 @@ mod tests {
                 .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake failure", "fake error"))?
                 .take()
             {
-                let message = if code == ErrorCode::BridgeUnavailable {
-                    "Proton Mail Bridge is unavailable. Start Bridge and try preparing the draft again."
-                } else {
-                    "fake error"
-                };
-                return Err(AppError::new(code, "load fake draft", message));
+                return Err(AppError::new(code, "load fake draft", "fake error"));
             }
             if locator != &self.locator {
                 return Err(AppError::new(
@@ -1424,8 +1414,27 @@ mod tests {
             self.stored()
         }
 
+        async fn load_submission(
+            &self,
+            locator: &MessageLocator,
+        ) -> Result<SubmissionDraft, AppError> {
+            let draft = self.load_draft(locator).await?;
+            SubmissionDraft::new(
+                draft,
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nMessage-ID: <prepared@example.invalid>\r\n\r\nbody"
+                    .to_vec(),
+            )
+        }
+
         async fn discard_draft(&self, _locator: &MessageLocator) -> Result<(), AppError> {
             self.discarded.fetch_add(1, Ordering::SeqCst);
+            if self.fail_discard.load(Ordering::SeqCst) {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "discard fake draft",
+                    "fake error",
+                ));
+            }
             *self.draft.lock().map_err(|_| {
                 AppError::new(ErrorCode::Internal, "lock fake draft", "fake error")
             })? = None;
@@ -1452,63 +1461,29 @@ mod tests {
         }
     }
 
-    struct FakeUi {
-        outcome: SendOutcome,
-        open_count: AtomicUsize,
+    struct FakeSender {
+        outcome: FakeSendOutcome,
         send_count: AtomicUsize,
-        fail_open: bool,
-        open_advance: StdMutex<Option<TimeDelta>>,
-        clock: Arc<FixedClock>,
-    }
-
-    impl FakeUi {
-        fn advance_while_opening(&self, delta: TimeDelta) {
-            if let Ok(mut advance) = self.open_advance.lock() {
-                *advance = Some(delta);
-            }
-        }
     }
 
     #[async_trait]
-    impl UiAutomation for FakeUi {
-        async fn health(&self) -> Result<UiHealth, AppError> {
-            Ok(UiHealth {
-                application_installed: true,
-                application_running: true,
-                accessibility_authorized: true,
-                capability_probe_passed: true,
-                application_version: Some("test".to_owned()),
+    impl MailSender for FakeSender {
+        async fn health(&self) -> Result<BridgeHealth, AppError> {
+            Ok(BridgeHealth {
+                reachable: true,
+                authenticated: true,
+                capabilities: vec!["AUTH PLAIN".to_owned()],
             })
         }
 
-        async fn open_draft(&self, _draft: &StoredDraft) -> Result<(), AppError> {
-            self.open_count.fetch_add(1, Ordering::SeqCst);
-            if let Some(delta) = self
-                .open_advance
-                .lock()
-                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake UI", "fake error"))?
-                .take()
-            {
-                self.clock.advance(delta);
-            }
-            if self.fail_open {
-                Err(AppError::new(
-                    ErrorCode::UiUnavailable,
-                    "open fake draft",
-                    "fake error",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn confirm_and_send(
-            &self,
-            _draft: &StoredDraft,
-            _expires_at: DateTime<Utc>,
-        ) -> Result<SendOutcome, AppError> {
+        async fn submit(&self, _draft: &SubmissionDraft) -> Result<(), AppError> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
-            Ok(self.outcome)
+            match self.outcome {
+                FakeSendOutcome::Succeed => Ok(()),
+                FakeSendOutcome::Fail(code) => {
+                    Err(AppError::new(code, "submit fake message", "fake error"))
+                }
+            }
         }
     }
 

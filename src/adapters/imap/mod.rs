@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, TryStreamExt};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
+    adapters::bridge::{decode_bridge_password, decode_certificate_sha256},
     application::ports::{
         BridgeHealth, EXTERNAL_TIMEOUT, MailMutation, MailRepository, RepositoryPage, SecureRandom,
     },
@@ -18,6 +19,7 @@ use crate::{
         mail::{
             AttachmentLocator, DraftContent, FolderSummary, MailFlag, MessageLocator,
             SearchCriteria, StoredAttachment, StoredDraft, StoredMessage, StoredMessageSummary,
+            SubmissionDraft,
         },
         value::{EmailAddress, MailboxName},
     },
@@ -76,28 +78,8 @@ impl BridgeImapRepository {
         config.validate()?;
         let certificate_der =
             verify_certificate(certificate_path, &config.bridge.certificate_sha256)?;
-        let certificate_sha256 = decode_sha256(&config.bridge.certificate_sha256)?;
-        let password = String::from_utf8(password_bytes.to_vec()).map_err(|error| {
-            AppError::with_source(
-                ErrorCode::NotConfigured,
-                "decode Bridge password",
-                "Bridge password in Keychain is malformed; run configure again.",
-                error,
-            )
-        })?;
-        if password.is_empty()
-            || password.len() > 4_096
-            || password
-                .chars()
-                .any(|character| matches!(character, '\0' | '\r' | '\n'))
-        {
-            return Err(AppError::new(
-                ErrorCode::NotConfigured,
-                "validate Bridge password",
-                "Bridge password in Keychain is malformed; run configure again.",
-            ));
-        }
-        let password = Zeroizing::new(password);
+        let certificate_sha256 = decode_certificate_sha256(&config.bridge.certificate_sha256)?;
+        let password = decode_bridge_password(password_bytes)?;
         Ok(Self {
             connector: BridgeConnector::new(
                 BridgeEndpoint {
@@ -109,7 +91,7 @@ impl BridgeImapRepository {
                 certificate_sha256,
                 config.bridge.username.clone(),
                 password,
-            ),
+            )?,
             folders: FolderMapping {
                 drafts: MailboxName::parse(config.folders.drafts.clone())?,
                 sent: MailboxName::parse(config.folders.sent.clone())?,
@@ -561,6 +543,25 @@ impl MailRepository for BridgeImapRepository {
                 parse_stored_draft(locator.clone(), &raw.bytes, raw.date, &self.account, None);
             close_session(&mut session).await;
             result
+        })
+        .await
+    }
+
+    async fn load_submission(&self, locator: &MessageLocator) -> Result<SubmissionDraft, AppError> {
+        self.timed("load Bridge draft for submission", async {
+            if locator.mailbox != self.folders.drafts {
+                return Err(AppError::new(
+                    ErrorCode::PermissionDenied,
+                    "authorize draft submission mailbox",
+                    "Draft reference does not identify the configured Drafts folder.",
+                ));
+            }
+            let mut session = self.connector.connect().await?;
+            let raw = fetch_validated_raw(&mut session, locator, true).await?;
+            let parsed =
+                parse_stored_draft(locator.clone(), &raw.bytes, raw.date, &self.account, None)?;
+            close_session(&mut session).await;
+            SubmissionDraft::new(parsed, raw.bytes)
         })
         .await
     }
@@ -1300,40 +1301,16 @@ async fn close_session(session: &mut ImapSession) {
     }
 }
 
-fn decode_sha256(value: &str) -> Result<[u8; 32], AppError> {
-    if value.len() != 64 {
-        return Err(AppError::validation(
-            "Bridge certificate fingerprint is malformed.",
-        ));
-    }
-    let mut output = [0_u8; 32];
-    let mut chunks = value.as_bytes().chunks_exact(2);
-    for (index, pair) in chunks.by_ref().enumerate() {
-        let pair = std::str::from_utf8(pair)
-            .map_err(|_| AppError::validation("Bridge certificate fingerprint is malformed."))?;
-        let byte = u8::from_str_radix(pair, 16)
-            .map_err(|_| AppError::validation("Bridge certificate fingerprint is malformed."))?;
-        let destination = output
-            .get_mut(index)
-            .ok_or_else(|| AppError::validation("Bridge certificate fingerprint is malformed."))?;
-        *destination = byte;
-    }
-    if !chunks.remainder().is_empty() {
-        output.zeroize();
-        return Err(AppError::validation(
-            "Bridge certificate fingerprint is malformed.",
-        ));
-    }
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use crate::domain::{mail::SearchCriteria, value::EmailAddress};
+    use crate::{
+        adapters::bridge::decode_certificate_sha256,
+        domain::{mail::SearchCriteria, value::EmailAddress},
+    };
 
-    use super::{build_search_query, decode_sha256, is_exact_sent_candidate, quote_search};
+    use super::{build_search_query, is_exact_sent_candidate, quote_search};
 
     #[test]
     fn search_values_are_quoted_without_command_injection() {
@@ -1366,10 +1343,10 @@ mod tests {
     #[test]
     fn certificate_digest_parser_rejects_malformed_input() {
         assert_eq!(
-            decode_sha256(&"ab".repeat(32)).expect("valid digest"),
+            decode_certificate_sha256(&"ab".repeat(32)).expect("valid digest"),
             [0xab; 32]
         );
-        assert!(decode_sha256(&"gg".repeat(32)).is_err());
+        assert!(decode_certificate_sha256(&"gg".repeat(32)).is_err());
     }
 
     #[test]

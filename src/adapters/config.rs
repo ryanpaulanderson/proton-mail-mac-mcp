@@ -32,7 +32,6 @@ pub struct AppPaths {
     pub support_dir: PathBuf,
     pub config_file: PathBuf,
     pub bridge_certificates_dir: PathBuf,
-    pub ui_script: PathBuf,
     pub downloads_dir: PathBuf,
 }
 
@@ -59,7 +58,6 @@ impl AppPaths {
         Self {
             config_file: support_dir.join("config.toml"),
             bridge_certificates_dir: support_dir.join("bridge-certificates"),
-            ui_script: support_dir.join("proton_mail_ui.applescript"),
             downloads_dir: support_dir.join("downloads"),
             support_dir,
         }
@@ -78,6 +76,37 @@ impl AppPaths {
 
     pub fn bridge_certificate(&self, sha256: &str) -> PathBuf {
         self.bridge_certificates_dir.join(format!("{sha256}.der"))
+    }
+
+    pub fn remove_legacy_ui_artifact(&self) -> Result<(), AppError> {
+        let path = self.support_dir.join("proton_mail_ui.applescript");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AppError::with_source(
+                    ErrorCode::PermissionDenied,
+                    "inspect legacy UI artifact",
+                    "The obsolete UI automation artifact could not be inspected.",
+                    error,
+                ));
+            }
+        };
+        if metadata.is_dir() {
+            return Err(AppError::new(
+                ErrorCode::PermissionDenied,
+                "remove legacy UI artifact",
+                "The obsolete UI automation artifact path is unexpectedly a directory.",
+            ));
+        }
+        fs::remove_file(path).map_err(|error| {
+            AppError::with_source(
+                ErrorCode::PermissionDenied,
+                "remove legacy UI artifact",
+                "The obsolete UI automation artifact could not be removed.",
+                error,
+            )
+        })
     }
 }
 
@@ -101,6 +130,10 @@ pub struct BridgeConfig {
     pub imap_port: u16,
     #[serde(default)]
     pub tls_mode: BridgeTlsMode,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default = "default_smtp_tls_mode")]
+    pub smtp_tls_mode: BridgeTlsMode,
     pub tls_server_name: String,
     pub certificate_sha256: String,
 }
@@ -116,6 +149,14 @@ impl Default for BridgeTlsMode {
     fn default() -> Self {
         Self::StartTls
     }
+}
+
+const fn default_smtp_port() -> u16 {
+    1025
+}
+
+const fn default_smtp_tls_mode() -> BridgeTlsMode {
+    BridgeTlsMode::StartTls
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,9 +240,13 @@ impl AppConfig {
         EmailAddress::parse(self.bridge.account.clone())?;
         EmailAddress::parse(self.bridge.username.clone())?;
         EmailAddress::parse(self.bridge.default_from.clone())?;
-        if self.bridge.host != "127.0.0.1" || self.bridge.imap_port == 0 {
+        if self.bridge.host != "127.0.0.1"
+            || self.bridge.imap_port == 0
+            || self.bridge.smtp_port == 0
+            || self.bridge.imap_port == self.bridge.smtp_port
+        {
             return Err(AppError::validation(
-                "Bridge must use a nonzero IMAP port on 127.0.0.1.",
+                "Bridge must use nonzero IMAP and SMTP ports on 127.0.0.1.",
             ));
         }
         if !matches!(
@@ -602,6 +647,8 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 imap_port: 1143,
                 tls_mode: BridgeTlsMode::StartTls,
+                smtp_port: 1025,
+                smtp_tls_mode: BridgeTlsMode::ImplicitTls,
                 tls_server_name: "127.0.0.1".to_owned(),
                 certificate_sha256: "a".repeat(64),
             },
@@ -671,16 +718,41 @@ mod tests {
     }
 
     #[test]
-    fn legacy_version_one_config_defaults_to_starttls() {
+    fn legacy_ui_artifact_is_removed_without_recursive_deletion() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let paths = AppPaths::for_root(directory.path().join("support"));
+        paths
+            .create_private_directories()
+            .expect("create private directories");
+        let artifact = paths.support_dir.join("proton_mail_ui.applescript");
+        std::fs::write(&artifact, "legacy generated source").expect("write legacy artifact");
+        paths
+            .remove_legacy_ui_artifact()
+            .expect("remove legacy artifact");
+        assert!(!artifact.exists());
+
+        std::fs::create_dir(&artifact).expect("create unexpected directory");
+        assert!(paths.remove_legacy_ui_artifact().is_err());
+        assert!(artifact.is_dir());
+    }
+
+    #[test]
+    fn legacy_version_one_config_defaults_both_transports_to_starttls() {
         let directory = tempfile::tempdir().expect("create test directory");
         let encoded = toml::to_string_pretty(&valid_config(directory.path()))
             .expect("encode configuration")
             .lines()
-            .filter(|line| !line.starts_with("tls_mode = "))
+            .filter(|line| {
+                !line.starts_with("tls_mode = ")
+                    && !line.starts_with("smtp_port = ")
+                    && !line.starts_with("smtp_tls_mode = ")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let decoded: AppConfig = toml::from_str(&encoded).expect("decode legacy configuration");
         assert_eq!(decoded.bridge.tls_mode, BridgeTlsMode::StartTls);
+        assert_eq!(decoded.bridge.smtp_port, 1025);
+        assert_eq!(decoded.bridge.smtp_tls_mode, BridgeTlsMode::StartTls);
         decoded.validate().expect("validate legacy configuration");
     }
 

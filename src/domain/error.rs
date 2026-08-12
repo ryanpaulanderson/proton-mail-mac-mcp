@@ -21,9 +21,7 @@ pub enum ErrorCode {
     DraftNotFound,
     TokenReferenceMismatch,
     Conflict,
-    AmbiguousUi,
-    UiUnavailable,
-    Cancelled,
+    SendRejected,
     SendUnknown,
     Internal,
 }

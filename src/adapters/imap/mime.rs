@@ -194,7 +194,7 @@ pub(super) fn parse_stored_draft(
             "Synchronized draft content differs from the requested draft.",
         ));
     }
-    let integrity_digest = draft_integrity_digest(&parsed, &content, message_id)?;
+    let integrity_digest = draft_integrity_digest(&parsed, &content, message_id, raw)?;
     Ok(StoredDraft {
         locator,
         message_id: message_id.to_owned(),
@@ -614,11 +614,13 @@ fn draft_integrity_digest(
     parsed: &Message<'_>,
     content: &DraftContent,
     message_id: &str,
+    raw: &[u8],
 ) -> Result<[u8; 32], AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"proton-mail-mac-mcp/stored-draft/v1\0");
+    digest.update(b"proton-mail-mac-mcp/stored-draft/v2\0");
     update_digest_field(&mut digest, &content.confirmation_digest());
     update_digest_field(&mut digest, message_id.as_bytes());
+    update_digest_field(&mut digest, &Sha256::digest(raw));
 
     let in_reply_to = parsed.in_reply_to().as_text().unwrap_or_default();
     if !in_reply_to.is_empty() {
@@ -950,6 +952,58 @@ mod tests {
         )
         .await
         .expect("build second draft MIME");
+        let fallback = fixed_date();
+        let first_summary = parse_summary(&first_raw, fallback).expect("parse first summary");
+        let second_summary = parse_summary(&second_raw, fallback).expect("parse second summary");
+        assert_eq!(first_summary.fingerprint, second_summary.fingerprint);
+
+        let first = parse_stored_draft(
+            locator_for(&first_summary),
+            &first_raw,
+            fallback,
+            &content.account,
+            Some(&content),
+        )
+        .expect("parse first draft");
+        let second = parse_stored_draft(
+            locator_for(&second_summary),
+            &second_raw,
+            fallback,
+            &content.account,
+            Some(&content),
+        )
+        .expect("parse second draft");
+
+        assert_eq!(
+            first.content.confirmation_digest(),
+            second.content.confirmation_digest()
+        );
+        assert_ne!(first.integrity_digest, second.integrity_digest);
+    }
+
+    #[tokio::test]
+    async fn complete_synchronized_mime_is_bound_to_the_stored_draft() {
+        let content = DraftContent {
+            mode: DraftMode::New,
+            account: EmailAddress::parse("sender@example.com").expect("valid sender"),
+            recipients: RecipientSet::new(
+                vec![EmailAddress::parse("recipient@example.com").expect("valid recipient")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("valid recipient set"),
+            subject: Subject::parse("MIME integrity").expect("valid subject"),
+            body: PlainTextBody::parse("Body").expect("valid body"),
+            attachments: Vec::new(),
+            in_reply_to: None,
+        };
+        let first_raw = build_draft_message(&content, "mime-integrity@example.invalid", None)
+            .await
+            .expect("build draft MIME");
+        let second_raw = String::from_utf8(first_raw.clone())
+            .expect("generated UTF-8 MIME")
+            .replace("X-Unsent: 1", "X-Unsent: 2")
+            .into_bytes();
         let fallback = fixed_date();
         let first_summary = parse_summary(&first_raw, fallback).expect("parse first summary");
         let second_summary = parse_summary(&second_raw, fallback).expect("parse second summary");

@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use super::{
     error::AppError,
@@ -252,11 +253,39 @@ pub struct StoredDraft {
     pub content: DraftContent,
 }
 
+/// A revalidated draft paired with its exact raw MIME representation.
+///
+/// The raw bytes are zeroized on drop and deliberately have no `Debug`
+/// implementation so private message content cannot enter diagnostics.
+pub struct SubmissionDraft {
+    pub draft: StoredDraft,
+    raw_message: Zeroizing<Vec<u8>>,
+}
+
+impl SubmissionDraft {
+    pub fn new(draft: StoredDraft, raw_message: Vec<u8>) -> Result<Self, AppError> {
+        if raw_message.is_empty() {
+            return Err(AppError::validation(
+                "Prepared draft MIME content must not be empty.",
+            ));
+        }
+        Ok(Self {
+            draft,
+            raw_message: Zeroizing::new(raw_message),
+        })
+    }
+
+    pub fn raw_message(&self) -> &[u8] {
+        self.raw_message.as_slice()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct DraftPreview {
     pub draft_ref: DraftRef,
     pub prepared_send_token: PreparedSendToken,
     pub expires_at: DateTime<Utc>,
+    pub confirmation_digest: String,
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -267,12 +296,4 @@ pub struct DraftPreview {
     pub body_preview_truncated: bool,
     pub attachment_names: Vec<String>,
     pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SendOutcome {
-    Sent,
-    Submitted,
-    Cancelled,
-    Unknown,
 }

@@ -8,8 +8,8 @@ use crate::domain::{
     error::AppError,
     mail::{
         AttachmentLocator, DraftContent, FolderSummary, MailFlag, MessageLocator,
-        OutgoingAttachment, SearchCriteria, SendOutcome, StoredAttachment, StoredDraft,
-        StoredMessage, StoredMessageSummary,
+        OutgoingAttachment, SearchCriteria, StoredAttachment, StoredDraft, StoredMessage,
+        StoredMessageSummary, SubmissionDraft,
     },
     value::{DraftRef, MailboxName, MessageRef},
 };
@@ -26,15 +26,6 @@ pub struct BridgeHealth {
     pub reachable: bool,
     pub authenticated: bool,
     pub capabilities: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UiHealth {
-    pub application_installed: bool,
-    pub application_running: bool,
-    pub accessibility_authorized: bool,
-    pub capability_probe_passed: bool,
-    pub application_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +72,8 @@ pub trait MailRepository: Send + Sync {
 
     async fn load_draft(&self, locator: &MessageLocator) -> Result<StoredDraft, AppError>;
 
+    async fn load_submission(&self, locator: &MessageLocator) -> Result<SubmissionDraft, AppError>;
+
     async fn discard_draft(&self, locator: &MessageLocator) -> Result<(), AppError>;
 
     async fn sent_contains_message_id(
@@ -91,16 +84,12 @@ pub trait MailRepository: Send + Sync {
 }
 
 #[async_trait]
-pub trait UiAutomation: Send + Sync {
-    async fn health(&self) -> Result<UiHealth, AppError>;
+pub trait MailSender: Send + Sync {
+    async fn health(&self) -> Result<BridgeHealth, AppError>;
 
-    async fn open_draft(&self, draft: &StoredDraft) -> Result<(), AppError>;
-
-    async fn confirm_and_send(
-        &self,
-        draft: &StoredDraft,
-        expires_at: DateTime<Utc>,
-    ) -> Result<SendOutcome, AppError>;
+    /// Submits the message at most once. An adapter must return `SendUnknown`
+    /// whenever it cannot prove that Bridge rejected or accepted the message.
+    async fn submit(&self, draft: &SubmissionDraft) -> Result<(), AppError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
