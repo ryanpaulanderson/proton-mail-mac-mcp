@@ -84,7 +84,11 @@ attention.
 | `validation_failed` | Input violates the closed contract. |
 | `resource_limit` | A bounded count/size/concurrency limit was exceeded. |
 | `not_found` | The exact item did not become available. Avoid blindly repeating non-idempotent draft creation. |
-| `stale_ref` | Reference, cursor, draft, or token expired or no longer identifies the same state. |
+| `stale_ref` | An opaque reference/cursor is stale, or a prepared-send token is unknown or already consumed. |
+| `token_expired` | Prepare the draft again and review the newly returned preview and token. |
+| `draft_changed` | The prepared draft changed after preview. Prepare it again and review the replacement before sending. |
+| `draft_not_found` | The prepared draft no longer exists. Prepare a new draft and review it before sending. |
+| `token_reference_mismatch` | Use the draft reference and token returned together by the same preview; the attempted token is consumed. |
 | `conflict` | Re-read state; the message/draft changed, a postcondition failed, or a draft write outcome requires inspecting Drafts/Trash before retry. |
 | `send_rejected` | Bridge definitively rejected submission. The token is consumed; correct the cause and prepare again. |
 | `send_unknown` | A send may have occurred. Inspect Sent by exact content before any new attempt. |

@@ -418,7 +418,7 @@ impl MailMcpServer {
 
     #[tool(
         name = "proton_send_prepared",
-        description = "Submit the exact unchanged prepared draft once through pinned loopback Bridge SMTP. Consumes the short-lived token before revalidation and verifies the exact Message-ID in Sent. Call only after presenting the exact full content and confirmation digest for explicit user approval. Never retry a send_unknown result.",
+        description = "Submit the exact unchanged prepared draft once through pinned loopback Bridge SMTP. The 10-minute review window starts when the preview is returned. Consumes the token before revalidation or SMTP effects; expired tokens, changed or missing drafts, token/reference mismatches, and pre-submission Bridge unavailability have distinct error categories. Verifies the exact Message-ID in Sent. Call only after presenting the exact full content and confirmation digest for explicit user approval. Never retry a send_unknown result.",
         annotations(
             title = "Send prepared Proton Mail draft",
             read_only_hint = false,

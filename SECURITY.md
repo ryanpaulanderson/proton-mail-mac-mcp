@@ -53,7 +53,8 @@ Important enforced properties include:
   checks;
 - atomic IMAP MOVE with no copy-and-delete fallback;
 - recoverable Trash-only deletion and no EXPUNGE or permanent-delete path;
-- a ten-minute, single-use, cryptographically random confirmation token bound
+- a ten-minute review window starting when the preview is returned, represented
+  by a single-use, cryptographically random confirmation token bound
   to the exact account, recipients, subject, normalized body, attachment bytes,
   Message-ID, thread state, and complete synchronized MIME;
 - explicit approval of the exact content and confirmation digest before one
@@ -64,6 +65,12 @@ Important enforced properties include:
 - a distinct `send_rejected` result for definite SMTP rejection and a
   conservative `send_unknown` result for any uncertainty after DATA begins;
 - no blind retry when a send outcome is uncertain.
+
+Every send attempt consumes its token before external validation or SMTP
+effects. Expiry, changed or missing drafts, token/reference mismatch, and
+pre-submission Bridge unavailability have distinct privacy-safe error
+categories. Once submission may have begun, failures collapse to
+`send_unknown` so callers inspect Sent instead of retrying.
 
 See [the architecture](docs/architecture.md), [the tool contract](docs/tool-reference.md),
 and [the compatibility matrix](docs/compatibility.md) for implementation and
