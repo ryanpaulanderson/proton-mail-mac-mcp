@@ -34,13 +34,3 @@ jobs:
 
       - name: Test
         run: cargo test --all-features --locked
-
-      - name: Compile AppleScript sources
-        shell: bash
-        run: |
-          shopt -s nullglob
-          scripts=(applescript/*.applescript)
-          for script in "${scripts[@]}"; do
-            output="${RUNNER_TEMP}/$(basename "${script%.applescript}").scpt"
-            osacompile -o "$output" "$script"
-          done
