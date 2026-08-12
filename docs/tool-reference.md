@@ -71,7 +71,7 @@ Sent. `draft_cleanup=cleaned` means this operation moved the source draft to
 Trash. `already_absent` means the exact source draft was already gone or its
 absence was verified after an ambiguous move result. `attention_required` is
 reserved for an unresolved cleanup state and includes
-`draft_cleanup_recovery`; follow that guidance without resending the verified
+`recovery_guidance`; follow that guidance without resending the verified
 message.
 
 `proton_discard_draft` uses the same cleanup states and is idempotent. Repeating

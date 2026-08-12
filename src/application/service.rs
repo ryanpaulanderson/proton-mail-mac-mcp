@@ -106,7 +106,7 @@ pub struct DraftCleanupResult {
 pub struct SendResult {
     pub status: SendStatus,
     pub draft_cleanup: DraftCleanupStatus,
-    pub draft_cleanup_recovery: Option<String>,
+    pub recovery_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -549,7 +549,7 @@ impl MailApplication {
                 Ok(SendResult {
                     status: SendStatus::Sent,
                     draft_cleanup: cleanup.status,
-                    draft_cleanup_recovery: cleanup.recovery_guidance,
+                    recovery_guidance: cleanup.recovery_guidance,
                 })
             }
             Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(AppError::new(
@@ -938,7 +938,7 @@ mod tests {
             .expect("send exact prepared draft");
         assert_eq!(result.status, SendStatus::Sent);
         assert_eq!(result.draft_cleanup, DraftCleanupStatus::Cleaned);
-        assert_eq!(result.draft_cleanup_recovery, None);
+        assert_eq!(result.recovery_guidance, None);
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
 
         let replay = fixture
@@ -1025,7 +1025,7 @@ mod tests {
 
         assert_eq!(sent.status, SendStatus::Sent);
         assert_eq!(sent.draft_cleanup, DraftCleanupStatus::AlreadyAbsent);
-        assert_eq!(sent.draft_cleanup_recovery, None);
+        assert_eq!(sent.recovery_guidance, None);
         assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
     }
@@ -1051,7 +1051,7 @@ mod tests {
             .expect("repeat cleanup after partial failure");
 
         assert_eq!(sent.draft_cleanup, DraftCleanupStatus::AlreadyAbsent);
-        assert_eq!(sent.draft_cleanup_recovery, None);
+        assert_eq!(sent.recovery_guidance, None);
         assert_eq!(repeated.status, DraftCleanupStatus::AlreadyAbsent);
         assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
@@ -1286,7 +1286,7 @@ mod tests {
         assert_eq!(result.draft_cleanup, DraftCleanupStatus::AttentionRequired);
         assert!(
             result
-                .draft_cleanup_recovery
+                .recovery_guidance
                 .as_deref()
                 .is_some_and(|guidance| guidance.contains("do not resend"))
         );
