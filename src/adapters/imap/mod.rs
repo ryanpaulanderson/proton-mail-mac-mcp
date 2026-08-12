@@ -566,6 +566,42 @@ impl MailRepository for BridgeImapRepository {
         .await
     }
 
+    async fn draft_exists(&self, locator: &MessageLocator) -> Result<bool, AppError> {
+        self.timed("verify Bridge draft presence", async {
+            if locator.mailbox != self.folders.drafts {
+                return Err(AppError::new(
+                    ErrorCode::PermissionDenied,
+                    "authorize draft presence check",
+                    "Draft reference does not identify the configured Drafts folder.",
+                ));
+            }
+            let mut session = self.connector.connect().await?;
+            let selected = session
+                .examine(locator.mailbox.as_str())
+                .await
+                .map_err(imap_error(
+                    "select Drafts for presence check",
+                    "Configured Drafts folder could not be selected.",
+                ))?;
+            if selected.uid_validity != Some(locator.uid_validity) {
+                close_session(&mut session).await;
+                return Err(AppError::new(
+                    ErrorCode::StaleRef,
+                    "validate draft mailbox UIDVALIDITY",
+                    "Draft presence cannot be verified because the mailbox identity changed.",
+                ));
+            }
+            let result = match validate_selected_message(&mut session, locator).await {
+                Ok(()) => Ok(true),
+                Err(error) if error.code() == ErrorCode::StaleRef => Ok(false),
+                Err(error) => Err(error),
+            };
+            close_session(&mut session).await;
+            result
+        })
+        .await
+    }
+
     async fn discard_draft(&self, locator: &MessageLocator) -> Result<(), AppError> {
         self.timed("discard Bridge draft", async {
             if locator.mailbox != self.folders.drafts {
@@ -779,6 +815,13 @@ async fn select_and_validate(
             "Message reference is stale because the mailbox identity changed.",
         ));
     }
+    validate_selected_message(session, locator).await
+}
+
+async fn validate_selected_message(
+    session: &mut ImapSession,
+    locator: &MessageLocator,
+) -> Result<(), AppError> {
     let sequence = locator.uid.to_string();
     let stream = session
         .uid_fetch(sequence, metadata_fetch_query())

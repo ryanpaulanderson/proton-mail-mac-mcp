@@ -74,6 +74,11 @@ pub trait MailRepository: Send + Sync {
 
     async fn load_submission(&self, locator: &MessageLocator) -> Result<SubmissionDraft, AppError>;
 
+    /// Reports whether the exact draft identity is still present. A stale
+    /// mailbox identity must remain an error rather than being treated as
+    /// verified absence.
+    async fn draft_exists(&self, locator: &MessageLocator) -> Result<bool, AppError>;
+
     async fn discard_draft(&self, locator: &MessageLocator) -> Result<(), AppError>;
 
     async fn sent_contains_message_id(

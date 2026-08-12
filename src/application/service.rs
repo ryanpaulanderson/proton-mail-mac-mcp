@@ -583,16 +583,14 @@ impl MailApplication {
     }
 
     async fn cleanup_draft(&self, locator: &MessageLocator) -> DraftCleanupResult {
-        match self.repository.load_draft(locator).await {
-            Ok(_) => match self.repository.discard_draft(locator).await {
+        match self.repository.draft_exists(locator).await {
+            Ok(true) => match self.repository.discard_draft(locator).await {
                 Ok(()) => draft_cleanup_result(DraftCleanupStatus::Cleaned),
                 Err(discard_error) => {
-                    let verification = self.repository.load_draft(locator).await;
+                    let verification = self.repository.draft_exists(locator).await;
                     match verification {
-                        Err(error) if draft_is_absent(&error) => {
-                            draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent)
-                        }
-                        Ok(_) | Err(_) => {
+                        Ok(false) => draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent),
+                        Ok(true) | Err(_) => {
                             tracing::warn!(
                                 operation = "cleanup_draft",
                                 error_code = ?discard_error.code(),
@@ -603,9 +601,7 @@ impl MailApplication {
                     }
                 }
             },
-            Err(error) if draft_is_absent(&error) => {
-                draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent)
-            }
+            Ok(false) => draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent),
             Err(error) => {
                 tracing::warn!(
                     operation = "verify_draft_cleanup",
@@ -754,10 +750,6 @@ impl MailApplication {
             );
         }
     }
-}
-
-fn draft_is_absent(error: &AppError) -> bool {
-    matches!(error.code(), ErrorCode::NotFound | ErrorCode::StaleRef)
 }
 
 fn draft_cleanup_result(status: DraftCleanupStatus) -> DraftCleanupResult {
@@ -1063,7 +1055,7 @@ mod tests {
         let preview = fixture.prepare().await;
         fixture
             .repository
-            .fail_next_load(ErrorCode::BridgeUnavailable);
+            .fail_next_presence_check(ErrorCode::BridgeUnavailable);
 
         let cleanup = fixture
             .application
@@ -1080,6 +1072,26 @@ mod tests {
         );
         assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_draft_identity_is_unresolved_instead_of_already_absent() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_next_presence_check(ErrorCode::StaleRef);
+
+        let cleanup = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("represent stale identity as unresolved cleanup");
+
+        assert_eq!(cleanup.status, DraftCleanupStatus::AttentionRequired);
+        assert!(cleanup.recovery_guidance.is_some());
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert!(fixture.repository.stored().is_ok());
     }
 
     #[tokio::test]
@@ -1426,6 +1438,7 @@ mod tests {
         fail_discard: AtomicBool,
         fail_discard_after_removal: AtomicBool,
         load_failure: StdMutex<Option<ErrorCode>>,
+        presence_failure: StdMutex<Option<ErrorCode>>,
         prepare_advance: StdMutex<Option<TimeDelta>>,
         clock: Arc<FixedClock>,
     }
@@ -1443,6 +1456,7 @@ mod tests {
                 fail_discard: AtomicBool::new(false),
                 fail_discard_after_removal: AtomicBool::new(false),
                 load_failure: StdMutex::new(None),
+                presence_failure: StdMutex::new(None),
                 prepare_advance: StdMutex::new(None),
                 clock,
             }
@@ -1476,6 +1490,12 @@ mod tests {
 
         fn fail_next_load(&self, code: ErrorCode) {
             if let Ok(mut failure) = self.load_failure.lock() {
+                *failure = Some(code);
+            }
+        }
+
+        fn fail_next_presence_check(&self, code: ErrorCode) {
+            if let Ok(mut failure) = self.presence_failure.lock() {
                 *failure = Some(code);
             }
         }
@@ -1603,6 +1623,34 @@ mod tests {
                 b"From: sender@example.com\r\nTo: recipient@example.com\r\nMessage-ID: <prepared@example.invalid>\r\n\r\nbody"
                     .to_vec(),
             )
+        }
+
+        async fn draft_exists(&self, locator: &MessageLocator) -> Result<bool, AppError> {
+            if let Some(code) = self
+                .presence_failure
+                .lock()
+                .map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "lock fake presence", "fake error")
+                })?
+                .take()
+            {
+                return Err(AppError::new(
+                    code,
+                    "verify fake draft presence",
+                    "fake error",
+                ));
+            }
+            if locator != &self.locator {
+                return Err(AppError::new(
+                    ErrorCode::StaleRef,
+                    "verify fake draft presence",
+                    "fake error",
+                ));
+            }
+            self.draft
+                .lock()
+                .map(|draft| draft.is_some())
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake draft", "fake error"))
         }
 
         async fn discard_draft(&self, _locator: &MessageLocator) -> Result<(), AppError> {

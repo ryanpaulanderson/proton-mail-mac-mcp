@@ -78,7 +78,9 @@ message.
 it after the exact draft is gone returns `already_absent` without another
 mailbox mutation. Its additive `success` field remains `true` for `cleaned` and
 `already_absent`, while `recovery_guidance` is populated only for
-`attention_required`.
+`attention_required`. A stale mailbox identity, including changed UIDVALIDITY,
+is not proof of absence and therefore remains `attention_required` rather than
+being reported as `already_absent`.
 
 ## Stable error categories
 
