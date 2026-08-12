@@ -64,6 +64,9 @@ Important enforced properties include:
   Message-ID verification in Sent;
 - a distinct `send_rejected` result for definite SMTP rejection and a
   conservative `send_unknown` result for any uncertainty after DATA begins;
+- idempotent post-send draft cleanup that distinguishes a verified move from an
+  already-absent source and never turns cleanup uncertainty into permission to
+  resend; and
 - no blind retry when a send outcome is uncertain.
 
 Every send attempt consumes its token before external validation or SMTP
