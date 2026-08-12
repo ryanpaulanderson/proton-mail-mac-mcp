@@ -17,9 +17,7 @@ pub enum ErrorCode {
     NotFound,
     StaleRef,
     Conflict,
-    AmbiguousUi,
-    UiUnavailable,
-    Cancelled,
+    SendRejected,
     SendUnknown,
     Internal,
 }

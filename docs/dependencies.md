@@ -10,7 +10,7 @@ TLS, MIME, cryptography, Keychain, bounded async I/O, and CLI/config parsing.
 | Area | Crates | Rationale |
 | --- | --- | --- |
 | MCP and schemas | `rmcp`, `schemars`, `serde`, `serde_json` | Typed MCP stdio framing, closed JSON contracts, and structured output. |
-| Bridge protocol | `async-imap`, `native-tls`, `tokio-native-tls`, `tokio`, `futures` | Async IMAP with platform TLS, explicit timeouts, and bounded streams. |
+| Bridge protocol | `async-imap`, `native-tls`, `tokio-native-tls`, `tokio`, `futures` | Async IMAP, bounded SMTP I/O, platform TLS, and explicit timeouts. SMTP's small sequential protocol surface is implemented locally to preserve exact post-DATA uncertainty semantics without adding another dependency. |
 | Mail format | `mail-parser`, `mail-builder`, `email_address`, `chrono` | Standards-aware MIME/header/address/date handling instead of custom parsers. |
 | Cryptography | `chacha20poly1305`, `sha2`, `getrandom`, `base64`, `zeroize` | Authenticated opaque references, digests, CSPRNG, encoding, and secret cleanup. |
 | macOS secrets | `security-framework`, `security-framework-sys` | Native Keychain access without shelling out or putting secrets in arguments. |
@@ -31,13 +31,14 @@ substitute for the license texts shipped by dependencies.
   disabled for the Bridge connection, followed by an explicit SHA-256 peer pin.
 - MIME and IMAP libraries receive hard byte, count, stream, and time bounds
   before application data is returned.
+- SMTP replies, lines, capabilities, commands, header bytes, and DATA writes
+  are bounded. Protocol transcripts and AUTH material are never logged.
 - No dependency may write MCP diagnostics to stdout. Application tracing is
   restricted to this crate and emitted to stderr.
 - Dependabot evaluates Cargo and GitHub Actions nightly. Patch updates are not
   auto-merged because security-sensitive behavior requires human review.
 - GitHub Actions are pinned by full commit SHA. Cargo changes preserve the
-  committed lockfile and must pass formatting, Clippy, tests, and AppleScript
-  compilation.
+  committed lockfile and must pass formatting, Clippy, and tests.
 
 ## Update review checklist
 
@@ -46,5 +47,5 @@ substitute for the license texts shipped by dependencies.
 3. Review changes in unsafe/native/TLS/IMAP/MIME/crypto transitive surfaces.
 4. Confirm MSRV remains Rust 1.88 and regenerate `Cargo.lock` intentionally.
 5. Run all repository checks and relevant malformed-input tests.
-6. For `rmcp`, re-check generated schemas and tool annotations. For Proton UI
-   or protocol dependencies, repeat the compatibility procedure.
+6. For `rmcp`, re-check generated schemas and tool annotations. For Bridge
+   protocol dependencies, repeat the compatibility procedure.
