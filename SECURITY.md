@@ -53,7 +53,8 @@ Important enforced properties include:
   checks;
 - atomic IMAP MOVE with no copy-and-delete fallback;
 - recoverable Trash-only deletion and no EXPUNGE or permanent-delete path;
-- a ten-minute, single-use, cryptographically random confirmation token bound
+- a ten-minute review window starting when the preview is returned, represented
+  by a single-use, cryptographically random confirmation token bound
   to the exact account, recipients, subject, normalized body, attachment bytes,
   Message-ID, thread state, and complete synchronized MIME;
 - explicit approval of the exact content and confirmation digest before one
@@ -63,6 +64,9 @@ Important enforced properties include:
   Message-ID verification in Sent;
 - a distinct `send_rejected` result for definite SMTP rejection and a
   conservative `send_unknown` result for any uncertainty after DATA begins;
+- idempotent post-send draft cleanup that distinguishes a verified move from an
+  already-absent source and never turns cleanup uncertainty into permission to
+  resend; and
 - no blind retry when a send outcome is uncertain.
 
 Dependency updates are also constrained by a dedicated supply-chain control:
@@ -74,6 +78,12 @@ Actions updates remain manual because they change executable workflow policy;
 minor, major, non-semver, failed, ambiguous, or stale updates also require
 human review. The workflow does not check out or execute pull request code and
 does not broaden token permissions to merge workflow-file changes.
+
+Every send attempt consumes its token before external validation or SMTP
+effects. Expiry, changed or missing drafts, token/reference mismatch, and
+pre-submission Bridge unavailability have distinct privacy-safe error
+categories. Once submission may have begun, failures collapse to
+`send_unknown` so callers inspect Sent instead of retrying.
 
 See [the architecture](docs/architecture.md), [the tool contract](docs/tool-reference.md),
 and [the compatibility matrix](docs/compatibility.md) for implementation and

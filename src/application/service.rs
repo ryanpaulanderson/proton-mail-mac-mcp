@@ -27,6 +27,7 @@ use super::ports::{
 
 const CURSOR_TTL: TimeDelta = TimeDelta::minutes(15);
 const CONFIRMATION_TTL: TimeDelta = TimeDelta::minutes(10);
+const EXPIRED_CONFIRMATION_RETENTION: TimeDelta = TimeDelta::hours(1);
 const BODY_PREVIEW_CHARS: usize = 500;
 const SENT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 const SENT_VERIFICATION_POLL: Duration = Duration::from_millis(500);
@@ -90,14 +91,22 @@ pub enum SendStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DraftCleanupStatus {
-    MovedToTrash,
+    Cleaned,
+    AlreadyAbsent,
     AttentionRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftCleanupResult {
+    pub status: DraftCleanupStatus,
+    pub recovery_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SendResult {
     pub status: SendStatus,
     pub draft_cleanup: DraftCleanupStatus,
+    pub recovery_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -457,9 +466,12 @@ impl MailApplication {
         result
     }
 
-    pub async fn discard_draft(&self, draft_ref: &DraftRef) -> Result<(), AppError> {
+    pub async fn discard_draft(
+        &self,
+        draft_ref: &DraftRef,
+    ) -> Result<DraftCleanupResult, AppError> {
         let locator = self.references.decode_draft(draft_ref).await?;
-        self.repository.discard_draft(&locator).await
+        Ok(self.cleanup_draft(&locator).await)
     }
 
     pub async fn send_prepared(
@@ -470,8 +482,9 @@ impl MailApplication {
         let now = self.clock.now();
         let record = {
             let mut confirmations = self.confirmations.lock().await;
-            confirmations.retain(|_, state| state.expires_at() > now);
-            confirmations.remove(&token_key(token.as_str()))
+            let record = confirmations.remove(&token_key(token.as_str()));
+            retain_classifiable_confirmations(&mut confirmations, now);
+            record
         }
         .and_then(|state| match state {
             ConfirmationState::Ready(record) => Some(record),
@@ -481,32 +494,43 @@ impl MailApplication {
             AppError::new(
                 ErrorCode::StaleRef,
                 "consume send confirmation",
-                "Prepared send token is expired, unknown, or already used.",
+                "Prepared send token is unknown or already used. Prepare the draft again before sending.",
             )
         })?;
 
-        if &record.draft_ref != draft_ref || record.expires_at <= now {
+        if record.expires_at <= now {
             return Err(AppError::new(
-                ErrorCode::StaleRef,
+                ErrorCode::TokenExpired,
                 "validate send confirmation",
-                "Prepared send token does not match this draft or has expired.",
+                "Prepared send token expired. Prepare the draft again and review the new preview before sending.",
+            ));
+        }
+        if &record.draft_ref != draft_ref {
+            return Err(AppError::new(
+                ErrorCode::TokenReferenceMismatch,
+                "validate send confirmation",
+                "Prepared send token does not match this draft reference. Use the draft reference and token returned by the same preview.",
             ));
         }
         let requested_locator = self.references.decode_draft(draft_ref).await?;
         if requested_locator != record.draft {
             return Err(AppError::new(
-                ErrorCode::StaleRef,
+                ErrorCode::TokenReferenceMismatch,
                 "validate draft reference",
-                "Draft reference no longer identifies the prepared draft.",
+                "Prepared send token does not match this draft reference. Use the draft reference and token returned by the same preview.",
             ));
         }
 
-        let submission = self.repository.load_submission(&record.draft).await?;
+        let submission = self
+            .repository
+            .load_submission(&record.draft)
+            .await
+            .map_err(classify_prepared_draft_load)?;
         if submission.draft.content.confirmation_digest() != record.digest
             || submission.draft.integrity_digest != record.integrity_digest
         {
             return Err(AppError::new(
-                ErrorCode::Conflict,
+                ErrorCode::DraftChanged,
                 "validate prepared draft",
                 "Draft changed after preview; prepare it again before sending.",
             ));
@@ -521,24 +545,11 @@ impl MailApplication {
         .await;
         match verification {
             Ok(Ok(true)) => {
-                let draft_cleanup = match self
-                    .repository
-                    .discard_draft(&submission.draft.locator)
-                    .await
-                {
-                    Ok(()) => DraftCleanupStatus::MovedToTrash,
-                    Err(error) => {
-                        tracing::warn!(
-                            operation = "cleanup_sent_draft",
-                            error_code = ?error.code(),
-                            "sent message was verified but its source draft remains"
-                        );
-                        DraftCleanupStatus::AttentionRequired
-                    }
-                };
+                let cleanup = self.cleanup_draft(&submission.draft.locator).await;
                 Ok(SendResult {
                     status: SendStatus::Sent,
-                    draft_cleanup,
+                    draft_cleanup: cleanup.status,
+                    recovery_guidance: cleanup.recovery_guidance,
                 })
             }
             Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(AppError::new(
@@ -571,18 +582,57 @@ impl MailApplication {
         }
     }
 
+    async fn cleanup_draft(&self, locator: &MessageLocator) -> DraftCleanupResult {
+        match self.repository.draft_exists(locator).await {
+            Ok(true) => match self.repository.discard_draft(locator).await {
+                Ok(()) => draft_cleanup_result(DraftCleanupStatus::Cleaned),
+                Err(discard_error) => {
+                    let verification = self.repository.draft_exists(locator).await;
+                    match verification {
+                        Ok(false) => draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent),
+                        Ok(true) | Err(_) => {
+                            tracing::warn!(
+                                operation = "cleanup_draft",
+                                error_code = ?discard_error.code(),
+                                "draft cleanup remains unresolved"
+                            );
+                            unresolved_draft_cleanup()
+                        }
+                    }
+                }
+            },
+            Ok(false) => draft_cleanup_result(DraftCleanupStatus::AlreadyAbsent),
+            Err(error) => {
+                tracing::warn!(
+                    operation = "verify_draft_cleanup",
+                    error_code = ?error.code(),
+                    "draft cleanup state could not be verified"
+                );
+                unresolved_draft_cleanup()
+            }
+        }
+    }
+
     async fn prepare_preview(
         &self,
         stored: StoredDraft,
         reservation: &ConfirmationReservation,
     ) -> Result<DraftPreview, AppError> {
-        if reservation.expires_at <= self.clock.now() {
+        let now = self.clock.now();
+        if reservation.expires_at <= now {
             return Err(AppError::new(
                 ErrorCode::StaleRef,
                 "finalize send confirmation",
                 "Prepared send reservation expired before the preview was ready.",
             ));
         }
+        let expires_at = now.checked_add_signed(CONFIRMATION_TTL).ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Internal,
+                "finalize send confirmation",
+                "Unable to create a send confirmation.",
+            )
+        })?;
         let draft_ref = self.references.encode_draft(&stored.locator).await?;
         let digest = stored.content.confirmation_digest();
         {
@@ -599,7 +649,7 @@ impl MailApplication {
                 draft_ref: draft_ref.clone(),
                 digest,
                 integrity_digest: stored.integrity_digest,
-                expires_at: reservation.expires_at,
+                expires_at,
             });
         }
 
@@ -625,7 +675,7 @@ impl MailApplication {
         Ok(DraftPreview {
             draft_ref,
             prepared_send_token: reservation.token.clone(),
-            expires_at: reservation.expires_at,
+            expires_at,
             confirmation_digest: URL_SAFE_NO_PAD.encode(digest),
             from: stored.content.account.to_string(),
             to: addresses_to_strings(stored.content.recipients.to()),
@@ -660,8 +710,12 @@ impl MailApplication {
             let encoded = URL_SAFE_NO_PAD.encode(token_bytes);
             let key = token_key(&encoded);
             let mut confirmations = self.confirmations.lock().await;
-            confirmations.retain(|_, state| state.expires_at() > now);
-            if confirmations.len() >= MAX_PENDING_CONFIRMATIONS {
+            retain_classifiable_confirmations(&mut confirmations, now);
+            let pending = confirmations
+                .values()
+                .filter(|state| state.expires_at() > now)
+                .count();
+            if pending >= MAX_PENDING_CONFIRMATIONS {
                 return Err(AppError::resource_limit(
                     "Too many prepared sends are pending; use or let an existing token expire.",
                 ));
@@ -695,6 +749,46 @@ impl MailApplication {
                 "draft cleanup could not be verified; inspect Drafts and Trash before retrying"
             );
         }
+    }
+}
+
+fn draft_cleanup_result(status: DraftCleanupStatus) -> DraftCleanupResult {
+    DraftCleanupResult {
+        status,
+        recovery_guidance: None,
+    }
+}
+
+fn unresolved_draft_cleanup() -> DraftCleanupResult {
+    DraftCleanupResult {
+        status: DraftCleanupStatus::AttentionRequired,
+        recovery_guidance: Some(
+            "Inspect Drafts and Trash for the source draft, then retry draft cleanup if it remains. If delivery was already verified, do not resend the message."
+                .to_owned(),
+        ),
+    }
+}
+
+fn retain_classifiable_confirmations(
+    confirmations: &mut HashMap<[u8; 32], ConfirmationState>,
+    now: DateTime<Utc>,
+) {
+    confirmations.retain(|_, state| {
+        state
+            .expires_at()
+            .checked_add_signed(EXPIRED_CONFIRMATION_RETENTION)
+            .is_some_and(|purge_at| purge_at > now)
+    });
+}
+
+fn classify_prepared_draft_load(error: AppError) -> AppError {
+    match error.code() {
+        ErrorCode::NotFound | ErrorCode::StaleRef => AppError::new(
+            ErrorCode::DraftNotFound,
+            "load prepared draft",
+            "Prepared draft no longer exists. Prepare a new draft and review it before sending.",
+        ),
+        _ => error,
     }
 }
 
@@ -835,7 +929,8 @@ mod tests {
             .await
             .expect("send exact prepared draft");
         assert_eq!(result.status, SendStatus::Sent);
-        assert_eq!(result.draft_cleanup, DraftCleanupStatus::MovedToTrash);
+        assert_eq!(result.draft_cleanup, DraftCleanupStatus::Cleaned);
+        assert_eq!(result.recovery_guidance, None);
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
 
         let replay = fixture
@@ -865,6 +960,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn already_missing_draft_cleanup_converges_without_mutation() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture.repository.remove_draft();
+
+        let first = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("classify missing draft");
+        let second = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("repeat missing draft cleanup");
+
+        assert_eq!(first.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(second.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_cleanup_after_send_is_safe_and_does_not_resend() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+
+        let sent = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("send and clean draft");
+        let repeated = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("repeat cleanup");
+
+        assert_eq!(sent.draft_cleanup, DraftCleanupStatus::Cleaned);
+        assert_eq!(repeated.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn send_reports_already_absent_when_bridge_removed_source_draft() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::RemoveDraftThenFound);
+        let preview = fixture.prepare().await;
+
+        let sent = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("verify send whose source draft is already absent");
+
+        assert_eq!(sent.status, SendStatus::Sent);
+        assert_eq!(sent.draft_cleanup, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(sent.recovery_guidance, None);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_partial_failure_is_verified_as_already_absent() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_discard_after_removal
+            .store(true, Ordering::SeqCst);
+
+        let sent = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("verified send remains successful");
+        let repeated = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("repeat cleanup after partial failure");
+
+        assert_eq!(sent.draft_cleanup, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(sent.recovery_guidance, None);
+        assert_eq!(repeated.status, DraftCleanupStatus::AlreadyAbsent);
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_interruption_returns_actionable_unresolved_cleanup() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_next_presence_check(ErrorCode::BridgeUnavailable);
+
+        let cleanup = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("represent unresolved cleanup as a stable result");
+
+        assert_eq!(cleanup.status, DraftCleanupStatus::AttentionRequired);
+        assert!(
+            cleanup
+                .recovery_guidance
+                .as_deref()
+                .is_some_and(|guidance| guidance.contains("do not resend"))
+        );
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_draft_identity_is_unresolved_instead_of_already_absent() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_next_presence_check(ErrorCode::StaleRef);
+
+        let cleanup = fixture
+            .application
+            .discard_draft(&preview.draft_ref)
+            .await
+            .expect("represent stale identity as unresolved cleanup");
+
+        assert_eq!(cleanup.status, DraftCleanupStatus::AttentionRequired);
+        assert!(cleanup.recovery_guidance.is_some());
+        assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 0);
+        assert!(fixture.repository.stored().is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepared_send_survives_preparation_review_and_sent_sync_latency() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::FoundAfter(3));
+        fixture
+            .repository
+            .advance_while_preparing(TimeDelta::minutes(6));
+        let preview = fixture.prepare().await;
+        fixture.clock.advance(TimeDelta::minutes(8));
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await
+            .expect("send after bounded preparation, review, and Sent synchronization latency");
+
+        assert_eq!(result.status, SendStatus::Sent);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.repository.sent_checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn changed_draft_consumes_token_without_invoking_sender() {
         let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
@@ -874,9 +1124,11 @@ mod tests {
             .application
             .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
             .await;
+        let error = result.expect_err("reject changed draft");
+        assert_eq!(error.code(), ErrorCode::DraftChanged);
         assert_eq!(
-            result.expect_err("reject changed draft").code(),
-            ErrorCode::Conflict
+            error.public_message(),
+            "Draft changed after preview; prepare it again before sending."
         );
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
 
@@ -904,7 +1156,7 @@ mod tests {
             result
                 .expect_err("reject changed hidden draft headers")
                 .code(),
-            ErrorCode::Conflict
+            ErrorCode::DraftChanged
         );
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
@@ -914,13 +1166,68 @@ mod tests {
         let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
         let preview = fixture.prepare().await;
         fixture.clock.advance(TimeDelta::minutes(11));
+        let _newer_preview = fixture.prepare().await;
         let result = fixture
             .application
             .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
             .await;
+        let error = result.expect_err("reject expired token");
+        assert_eq!(error.code(), ErrorCode::TokenExpired);
         assert_eq!(
-            result.expect_err("reject expired token").code(),
-            ErrorCode::StaleRef
+            error.public_message(),
+            "Prepared send token expired. Prepare the draft again and review the new preview before sending."
+        );
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mismatched_token_and_reference_have_stable_category() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        let other_ref = DraftRef::from_encoded("x".repeat(32));
+
+        let result = fixture
+            .application
+            .send_prepared(&other_ref, &preview.prepared_send_token)
+            .await;
+
+        let error = result.expect_err("reject mismatched token and draft reference");
+        assert_eq!(error.code(), ErrorCode::TokenReferenceMismatch);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_prepared_draft_has_stable_category() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture.repository.remove_draft();
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await;
+
+        let error = result.expect_err("reject missing prepared draft");
+        assert_eq!(error.code(), ErrorCode::DraftNotFound);
+        assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_failure_loading_prepared_draft_is_preserved() {
+        let fixture = Fixture::new(FakeSendOutcome::Succeed, SentCheck::Found);
+        let preview = fixture.prepare().await;
+        fixture
+            .repository
+            .fail_next_load(ErrorCode::BridgeUnavailable);
+
+        let result = fixture
+            .application
+            .send_prepared(&preview.draft_ref, &preview.prepared_send_token)
+            .await;
+
+        assert_eq!(
+            result.expect_err("report Bridge failure").code(),
+            ErrorCode::BridgeUnavailable
         );
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 0);
     }
@@ -989,6 +1296,12 @@ mod tests {
             .expect("sent result remains authoritative");
         assert_eq!(result.status, SendStatus::Sent);
         assert_eq!(result.draft_cleanup, DraftCleanupStatus::AttentionRequired);
+        assert!(
+            result
+                .recovery_guidance
+                .as_deref()
+                .is_some_and(|guidance| guidance.contains("do not resend"))
+        );
         assert_eq!(fixture.sender.send_count.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.repository.discarded.load(Ordering::SeqCst), 1);
         assert!(fixture.repository.stored().is_ok());
@@ -1066,12 +1379,16 @@ mod tests {
     impl Fixture {
         fn new(outcome: FakeSendOutcome, sent_check: SentCheck) -> Self {
             let locator = test_locator();
-            let repository = Arc::new(FakeRepository::new(locator.clone(), sent_check));
+            let clock = Arc::new(FixedClock::new());
+            let repository = Arc::new(FakeRepository::new(
+                locator.clone(),
+                sent_check,
+                clock.clone(),
+            ));
             let sender = Arc::new(FakeSender {
                 outcome,
                 send_count: AtomicUsize::new(0),
             });
-            let clock = Arc::new(FixedClock::new());
             let application = MailApplication::new(
                 repository.clone(),
                 sender.clone(),
@@ -1097,9 +1414,10 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
     enum SentCheck {
         Found,
+        FoundAfter(usize),
+        RemoveDraftThenFound,
         Fail,
     }
 
@@ -1118,10 +1436,15 @@ mod tests {
         created: AtomicUsize,
         discarded: AtomicUsize,
         fail_discard: AtomicBool,
+        fail_discard_after_removal: AtomicBool,
+        load_failure: StdMutex<Option<ErrorCode>>,
+        presence_failure: StdMutex<Option<ErrorCode>>,
+        prepare_advance: StdMutex<Option<TimeDelta>>,
+        clock: Arc<FixedClock>,
     }
 
     impl FakeRepository {
-        fn new(locator: MessageLocator, sent_check: SentCheck) -> Self {
+        fn new(locator: MessageLocator, sent_check: SentCheck, clock: Arc<FixedClock>) -> Self {
             Self {
                 locator,
                 draft: StdMutex::new(None),
@@ -1131,6 +1454,11 @@ mod tests {
                 created: AtomicUsize::new(0),
                 discarded: AtomicUsize::new(0),
                 fail_discard: AtomicBool::new(false),
+                fail_discard_after_removal: AtomicBool::new(false),
+                load_failure: StdMutex::new(None),
+                presence_failure: StdMutex::new(None),
+                prepare_advance: StdMutex::new(None),
+                clock,
             }
         }
 
@@ -1145,6 +1473,30 @@ mod tests {
             let mut draft = self.draft.lock().expect("lock fake draft");
             if let Some(draft) = draft.as_mut() {
                 draft.integrity_digest = [7; 32];
+            }
+        }
+
+        fn advance_while_preparing(&self, delta: TimeDelta) {
+            if let Ok(mut advance) = self.prepare_advance.lock() {
+                *advance = Some(delta);
+            }
+        }
+
+        fn remove_draft(&self) {
+            if let Ok(mut draft) = self.draft.lock() {
+                *draft = None;
+            }
+        }
+
+        fn fail_next_load(&self, code: ErrorCode) {
+            if let Ok(mut failure) = self.load_failure.lock() {
+                *failure = Some(code);
+            }
+        }
+
+        fn fail_next_presence_check(&self, code: ErrorCode) {
+            if let Ok(mut failure) = self.presence_failure.lock() {
+                *failure = Some(code);
             }
         }
 
@@ -1214,6 +1566,14 @@ mod tests {
 
         async fn create_draft(&self, content: &DraftContent) -> Result<StoredDraft, AppError> {
             self.created.fetch_add(1, Ordering::SeqCst);
+            if let Some(delta) = self
+                .prepare_advance
+                .lock()
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake delay", "fake error"))?
+                .take()
+            {
+                self.clock.advance(delta);
+            }
             let stored = StoredDraft {
                 locator: self.locator.clone(),
                 message_id: "prepared@example.invalid".to_owned(),
@@ -1235,6 +1595,14 @@ mod tests {
         }
 
         async fn load_draft(&self, locator: &MessageLocator) -> Result<StoredDraft, AppError> {
+            if let Some(code) = self
+                .load_failure
+                .lock()
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake failure", "fake error"))?
+                .take()
+            {
+                return Err(AppError::new(code, "load fake draft", "fake error"));
+            }
             if locator != &self.locator {
                 return Err(AppError::new(
                     ErrorCode::StaleRef,
@@ -1257,8 +1625,49 @@ mod tests {
             )
         }
 
+        async fn draft_exists(&self, locator: &MessageLocator) -> Result<bool, AppError> {
+            if let Some(code) = self
+                .presence_failure
+                .lock()
+                .map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "lock fake presence", "fake error")
+                })?
+                .take()
+            {
+                return Err(AppError::new(
+                    code,
+                    "verify fake draft presence",
+                    "fake error",
+                ));
+            }
+            if locator != &self.locator {
+                return Err(AppError::new(
+                    ErrorCode::StaleRef,
+                    "verify fake draft presence",
+                    "fake error",
+                ));
+            }
+            self.draft
+                .lock()
+                .map(|draft| draft.is_some())
+                .map_err(|_| AppError::new(ErrorCode::Internal, "lock fake draft", "fake error"))
+        }
+
         async fn discard_draft(&self, _locator: &MessageLocator) -> Result<(), AppError> {
             self.discarded.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_discard_after_removal
+                .swap(false, Ordering::SeqCst)
+            {
+                *self.draft.lock().map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "lock fake draft", "fake error")
+                })? = None;
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "verify fake draft discard",
+                    "fake error",
+                ));
+            }
             if self.fail_discard.load(Ordering::SeqCst) {
                 return Err(AppError::new(
                     ErrorCode::Conflict,
@@ -1278,8 +1687,17 @@ mod tests {
             _sent_after: DateTime<Utc>,
         ) -> Result<bool, AppError> {
             self.sent_checks.fetch_add(1, Ordering::SeqCst);
-            match self.sent_check {
+            match &self.sent_check {
                 SentCheck::Found => Ok(true),
+                SentCheck::FoundAfter(attempt) => {
+                    Ok(self.sent_checks.load(Ordering::SeqCst) >= *attempt)
+                }
+                SentCheck::RemoveDraftThenFound => {
+                    *self.draft.lock().map_err(|_| {
+                        AppError::new(ErrorCode::Internal, "lock fake draft", "fake error")
+                    })? = None;
+                    Ok(true)
+                }
                 SentCheck::Fail => Err(AppError::new(
                     ErrorCode::BridgeUnavailable,
                     "check fake Sent",

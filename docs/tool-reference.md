@@ -17,7 +17,7 @@ returned in a typed field.
 | `proton_trash_messages` | Move to configured Trash | Recoverable Trash-only action; never expunges. |
 | `proton_prepare_draft` | Create a Bridge draft | New/reply/reply-all/forward; returns preview, content digest, draft reference, and ten-minute single-use token. |
 | `proton_update_draft` | Replace a prepared draft | Creates a replacement, moves the prior draft to Trash, and returns a new digest and token. |
-| `proton_discard_draft` | Discard one draft | Moves only an exact Drafts item to Trash. |
+| `proton_discard_draft` | Discard one draft | Idempotently moves only an exact Drafts item to Trash and distinguishes `cleaned`, `already_absent`, and unresolved cleanup. |
 | `proton_send_prepared` | Send once through Bridge SMTP | Consumes token, reloads and re-digests the exact MIME, makes one SMTP transaction, and requires exact Sent verification. Never retry `send_unknown`. |
 | `proton_cleanup_downloads` | Remove expired managed files | Deletes only expired, tool-named entries in the private download directory. |
 
@@ -67,10 +67,20 @@ approval. The token and digest bind that content even when the response preview
 is truncated.
 
 A successful send returns `status=sent` only after exact Message-ID evidence in
-Sent. `draft_cleanup=moved_to_trash` confirms source-draft cleanup;
-`attention_required` means delivery is still verified but the source draft
-should be inspected manually. Never resend merely because cleanup needs
-attention.
+Sent. `draft_cleanup=cleaned` means this operation moved the source draft to
+Trash. `already_absent` means the exact source draft was already gone or its
+absence was verified after an ambiguous move result. `attention_required` is
+reserved for an unresolved cleanup state and includes
+`recovery_guidance`; follow that guidance without resending the verified
+message.
+
+`proton_discard_draft` uses the same cleanup states and is idempotent. Repeating
+it after the exact draft is gone returns `already_absent` without another
+mailbox mutation. Its additive `success` field remains `true` for `cleaned` and
+`already_absent`, while `recovery_guidance` is populated only for
+`attention_required`. A stale mailbox identity, including changed UIDVALIDITY,
+is not proof of absence and therefore remains `attention_required` rather than
+being reported as `already_absent`.
 
 ## Stable error categories
 
@@ -84,7 +94,11 @@ attention.
 | `validation_failed` | Input violates the closed contract. |
 | `resource_limit` | A bounded count/size/concurrency limit was exceeded. |
 | `not_found` | The exact item did not become available. Avoid blindly repeating non-idempotent draft creation. |
-| `stale_ref` | Reference, cursor, draft, or token expired or no longer identifies the same state. |
+| `stale_ref` | An opaque reference/cursor is stale, or a prepared-send token is unknown or already consumed. |
+| `token_expired` | Prepare the draft again and review the newly returned preview and token. |
+| `draft_changed` | The prepared draft changed after preview. Prepare it again and review the replacement before sending. |
+| `draft_not_found` | The prepared draft no longer exists. Prepare a new draft and review it before sending. |
+| `token_reference_mismatch` | Use the draft reference and token returned together by the same preview; the attempted token is consumed. |
 | `conflict` | Re-read state; the message/draft changed, a postcondition failed, or a draft write outcome requires inspecting Drafts/Trash before retry. |
 | `send_rejected` | Bridge definitively rejected submission. The token is consumed; correct the cause and prepare again. |
 | `send_unknown` | A send may have occurred. Inspect Sent by exact content before any new attempt. |

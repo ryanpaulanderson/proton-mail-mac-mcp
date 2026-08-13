@@ -77,9 +77,10 @@ sequenceDiagram
     participant S as Bridge SMTP
 
     C->>A: prepare draft(validated exact content)
-    A->>A: reserve bounded 10-minute token
+    A->>A: reserve bounded preparation slot
     A->>I: APPEND MIME with random Message-ID and Draft flag
     I-->>A: exact synchronized draft locator and MIME digest
+    A->>A: start bounded 10-minute review window
     A-->>C: preview + content digest + draft_ref + single-use token
     C->>C: present exact content and obtain explicit user approval
     C->>A: send_prepared(draft_ref, token)
@@ -88,7 +89,7 @@ sequenceDiagram
     A->>S: one authenticated SMTP transaction
     S-->>A: accepted, rejected, or uncertain
     A->>I: find exact Message-ID in Sent
-    A->>I: move source draft to Trash after verified send
+    A->>I: idempotently clean source draft after verified send
     A-->>C: sent + cleanup status, rejected, or send_unknown
 ```
 
@@ -97,8 +98,18 @@ account, To/CC/BCC lists, subject, normalized plain-text body, and every
 attachment's display name, media type, size, and SHA-256 digest. A separate
 stored-draft integrity digest binds the complete synchronized raw MIME plus the
 exact Message-ID and thread headers. Tokens contain 256 random bits, are stored
-only by SHA-256 lookup key, expire after ten minutes, and are consumed before
-draft or transport validation. At most 64 can be pending.
+only by SHA-256 lookup key, and expire ten minutes after the preview becomes
+ready, so Bridge synchronization does not consume human review time. Tokens
+are consumed before draft or transport validation. Expired records are
+retained for one bounded hour solely to classify a later attempt as
+`token_expired`; only lookup digests and non-content lifecycle state are
+retained. At most 64 unexpired preparations can be pending.
+
+Send validation reports `token_expired`, `token_reference_mismatch`,
+`draft_changed`, `draft_not_found`, and `bridge_unavailable` separately. These
+paths fail before SMTP submission and the consumed token cannot be replayed.
+Once SMTP DATA may have begun, every uncertain transport or verification
+failure becomes `send_unknown` and the application never retries.
 
 The SMTP adapter reuses the enrolled Bridge certificate and requires both
 hostname validation and the exact SHA-256 peer pin. It authenticates with the
@@ -113,8 +124,11 @@ After DATA begins, a write timeout, disconnect, malformed response, or missing
 final response is conservatively `send_unknown`; the server never retries it.
 A final SMTP rejection is `send_rejected`. A positive SMTP reply is not final
 success until IMAP finds exactly one recent Sent item with the prepared
-Message-ID. If source-draft cleanup then fails, the result remains `sent` and
-reports `attention_required` so callers do not retry a delivered message.
+Message-ID. Source-draft cleanup then converges on `cleaned` when this operation
+verifies the Trash move or `already_absent` when exact source absence is
+verified, including after an ambiguous move result. Only an unresolved state
+reports `attention_required`, with safe recovery guidance. The result remains
+`sent` in every cleanup case so callers never retry a delivered message.
 
 ## Persisted data
 

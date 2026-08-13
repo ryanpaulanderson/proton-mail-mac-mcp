@@ -22,7 +22,8 @@ AG or OpenAI.
 - Bridge credentials and the opaque-reference key live in macOS Keychain.
 - The server connects only to `127.0.0.1`, validates the enrolled Bridge
   certificate and hostname, and pins its SHA-256 digest.
-- Sending requires a 10-minute, single-use token bound to the exact account,
+- Sending requires a 10-minute, single-use token whose review window starts
+  when the preview is returned and is bound to the exact account,
   recipients, subject, body, attachment bytes, Message-ID, thread headers, and
   complete stored MIME. SMTP submission is attempted at most once.
 - A `send_unknown` result must never be retried blindly. Inspect Sent first.
@@ -161,8 +162,14 @@ returning mailbox content.
    reference and token. Any intervening draft change fails closed and requires
    a new preview.
 6. If the result is `send_unknown`, inspect Sent and do not retry blindly. A
-   successful result also reports whether the source draft moved to Trash or
-   still requires attention.
+   successful result also reports source-draft cleanup as `cleaned`,
+   `already_absent`, or `attention_required`. Cleanup can be retried safely with
+   `proton_discard_draft`; never resend a verified message because cleanup needs
+   attention.
+
+Token expiry, a changed or missing draft, a mismatched token/reference pair,
+and Bridge unavailability are reported separately with safe recovery guidance.
+The token is consumed on every send attempt, including these failures.
 
 See the [tool reference](docs/tool-reference.md) for all 14 tools, limits, and
 stable error categories.
