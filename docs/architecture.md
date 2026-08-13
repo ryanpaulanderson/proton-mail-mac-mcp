@@ -157,6 +157,18 @@ sizes, managed files, recipient batches, pending confirmations, and concurrent
 MCP calls are also bounded. No lock is held across network, filesystem, or
 other awaited external work.
 
+## Dependency update automation
+
+Dependabot evaluates Cargo and GitHub Actions dependencies on a nightly
+schedule. A separate `pull_request_target` workflow may merge only
+semver-patch Cargo updates authored by `dependabot[bot]` in this repository.
+It does not check out or execute pull request code; it fetches Dependabot
+metadata, waits for the complete reported check set to remain green, requires
+the macOS `CI / Quality and tests` check to pass, and merges only the exact
+head SHA that was validated. GitHub Actions updates remain subject to human
+review because they change executable workflow policy; minor, major,
+non-semver, failed, ambiguous, and stale updates also remain manual.
+
 ## Extension points
 
 The current axes of change map to ports: a future repository protocol, another
