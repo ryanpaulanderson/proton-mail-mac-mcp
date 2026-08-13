@@ -35,19 +35,22 @@ substitute for the license texts shipped by dependencies.
   are bounded. Protocol transcripts and AUTH material are never logged.
 - No dependency may write MCP diagnostics to stdout. Application tracing is
   restricted to this crate and emitted to stderr.
-- Dependabot evaluates Cargo and GitHub Actions nightly. Semver-patch updates
-  may be auto-merged by `.github/workflows/dependabot-auto-merge.yml` only when
-  the update is created by `dependabot[bot]`, the complete reported check set is
-  green and stable, and the repository's `CI / Quality and tests` check passes.
-  Minor, major, non-semver, failed, ambiguous, and stale updates remain for
-  human review.
+- Dependabot evaluates Cargo and GitHub Actions nightly. Semver-patch Cargo
+  updates may be auto-merged by `.github/workflows/dependabot-auto-merge.yml`
+  only when the update is created by `dependabot[bot]`, the complete reported
+  check set is green and stable, and the repository's `CI / Quality and tests`
+  check passes. GitHub Actions updates remain for human review because they
+  change executable workflow policy; minor, major, non-semver, failed,
+  ambiguous, and stale updates also remain manual.
 - GitHub Actions are pinned by full commit SHA. Cargo changes preserve the
   committed lockfile and must pass formatting, Clippy, and tests.
 
 The auto-merge workflow runs on `pull_request_target` so it can inspect trusted
 repository checks and merge metadata without checking out or executing the
 Dependabot branch. Its write-capable job is gated by the bot identity, exact
-repository, patch-only metadata, stable checks, and the pull request head SHA.
+repository, Cargo patch-only metadata, stable checks, and the pull request head
+SHA. The workflow intentionally does not attempt to use a broader token to
+merge workflow-file changes.
 
 ## Update review checklist
 

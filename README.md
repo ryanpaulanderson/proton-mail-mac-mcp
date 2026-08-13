@@ -177,8 +177,9 @@ cargo test --all-features --locked
 
 CI runs the same checks on macOS with exact Rust 1.88. Dependabot checks Cargo
 and GitHub Actions dependencies nightly at 03:00 America/New_York. Semver-patch
-Dependabot updates are automatically merged only after the complete CI check
-set is green and stable; larger updates remain subject to human review.
+Cargo updates are automatically merged only after the complete CI check set is
+green and stable; GitHub Actions and larger updates remain subject to human
+review because they change executable workflow policy.
 
 Current validation scope and Bridge protocol assumptions are recorded in
 [Compatibility](docs/compatibility.md). Direct dependency rationale is in

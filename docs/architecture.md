@@ -147,12 +147,13 @@ other awaited external work.
 
 Dependabot evaluates Cargo and GitHub Actions dependencies on a nightly
 schedule. A separate `pull_request_target` workflow may merge only
-semver-patch updates authored by `dependabot[bot]` in this repository. It does
-not check out or execute pull request code; it fetches Dependabot metadata,
-waits for the complete reported check set to remain green, requires the
-macOS `CI / Quality and tests` check to pass, and merges only the exact head
-SHA that was validated. Minor, major, non-semver, failed, ambiguous, and stale
-updates remain subject to human review.
+semver-patch Cargo updates authored by `dependabot[bot]` in this repository.
+It does not check out or execute pull request code; it fetches Dependabot
+metadata, waits for the complete reported check set to remain green, requires
+the macOS `CI / Quality and tests` check to pass, and merges only the exact
+head SHA that was validated. GitHub Actions updates remain subject to human
+review because they change executable workflow policy; minor, major,
+non-semver, failed, ambiguous, and stale updates also remain manual.
 
 ## Extension points
 

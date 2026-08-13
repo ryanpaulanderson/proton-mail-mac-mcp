@@ -24,6 +24,7 @@ jobs:
 
     outputs:
       is-patch: ${{ steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' }}
+      is-cargo: ${{ steps.dependabot-metadata.outputs.package-ecosystem == 'cargo' }}
 
     steps:
       - name: Fetch Dependabot metadata
@@ -37,7 +38,8 @@ jobs:
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.repository == 'ryanpaulanderson/proton-mail-mac-mcp' &&
-      needs.metadata.outputs.is-patch == 'true'
+      needs.metadata.outputs.is-patch == 'true' &&
+      needs.metadata.outputs.is-cargo == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 65
     permissions:
@@ -57,6 +59,7 @@ jobs:
           deadline=$((SECONDS + 3600))
           previous_signature=""
           settled_polls=0
+          checks_passed=false
           while (( SECONDS < deadline )); do
             checks="$(gh pr checks "$PR_URL" --json name,workflow,bucket 2>/dev/null || true)"
 
@@ -109,6 +112,7 @@ jobs:
 
               if (( settled_polls >= 3 )); then
                 echo "All reported CI checks passed."
+                checks_passed=true
                 break
               fi
               echo "CI checks are green and stable; waiting for late checks to register..."
@@ -122,7 +126,7 @@ jobs:
             sleep 30
           done
 
-          if (( SECONDS >= deadline )); then
+          if [[ "$checks_passed" != true ]]; then
             echo "Timed out waiting for CI checks."
             exit 1
           fi

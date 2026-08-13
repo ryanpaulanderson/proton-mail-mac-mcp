@@ -66,12 +66,14 @@ Important enforced properties include:
 - no blind retry when a send outcome is uncertain.
 
 Dependency updates are also constrained by a dedicated supply-chain control:
-Dependabot patch updates can be merged automatically only when the update is
-authored by the repository's Dependabot bot, the full reported check set is
-green and stable, the macOS `CI / Quality and tests` check passes, and the
-validated pull request head SHA still matches at merge time. The workflow does
-not check out or execute pull request code. Minor, major, non-semver, failed,
-ambiguous, or stale updates require human review.
+Dependabot semver-patch Cargo updates can be merged automatically only when
+the update is authored by the repository's Dependabot bot, the full reported
+check set is green and stable, the macOS `CI / Quality and tests` check passes,
+and the validated pull request head SHA still matches at merge time. GitHub
+Actions updates remain manual because they change executable workflow policy;
+minor, major, non-semver, failed, ambiguous, or stale updates also require
+human review. The workflow does not check out or execute pull request code and
+does not broaden token permissions to merge workflow-file changes.
 
 See [the architecture](docs/architecture.md), [the tool contract](docs/tool-reference.md),
 and [the compatibility matrix](docs/compatibility.md) for implementation and
