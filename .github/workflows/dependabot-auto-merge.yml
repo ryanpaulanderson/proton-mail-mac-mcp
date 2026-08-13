@@ -82,10 +82,11 @@ jobs:
                   workflow: .[0].workflow,
                   name: .[0].name,
                   bucket: (
-                    if any(.[]; .bucket == "pending") then "pending"
+                    # A failed rerun must not be hidden by a passing duplicate.
+                    if any(.[]; .bucket == "fail") then "fail"
+                    elif any(.[]; .bucket == "pending") then "pending"
                     elif any(.[]; .bucket == "pass") then "pass"
                     elif any(.[]; .bucket == "skipping") then "skipping"
-                    elif any(.[]; .bucket == "fail") then "fail"
                     else "cancel"
                     end
                   )
